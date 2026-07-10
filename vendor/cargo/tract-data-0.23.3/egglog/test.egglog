@@ -1,0 +1,82 @@
+(include "tdim.egglog")
+
+;; (let s (Var "s"))
+;; (set (lo s) 5)
+;; (let x (Add s one))
+;; ;; (let l (lo (Num 5)))
+;; (run 10)
+;; (extract (lo x))
+
+;; (let s (Var "s"))
+;; (let p (Var "p"))
+;; (set (lo s) 1)
+;; (set (lo p) 0)
+;; (set (hi (Add s p)) 4096)
+;; (run 30)
+;; (extract (hi p))
+
+
+;; (let s (Var "s"))
+;; 
+;; ;; (push)
+;; ;; (let a (Div (Mul s two) 2))
+;; ;; (run 10)
+;; ;; (extract a)
+;; ;; (pop)
+;; 
+;; ;; (push)
+;; ;; (let a (Add(Add s one) (Add s two)))
+;; ;; (run 10)
+;; ;; (extract a)
+;; ;; (pop)
+;; 
+;; ;; (push)
+;; ;; (let a (Add s (Neg s)))
+;; ;; (run 15)
+;; ;; (extract a)
+;; ;; (pop)
+;; 
+;; ;; (push)
+;; ;; (let a (Add (Add s one) (Add (Neg s) two)))
+;; ;; (run 10)
+;; ;; (extract a)
+;; ;; (pop)
+;; 
+;; (push)
+;; (let a (Add
+;; 	(Div (Add s one) 2)
+;; 	(Neg (Div (Add s mone) 2)))
+;; )
+;; (run 20)
+;; (extract a)
+;; (pop)
+;; 
+;; (push)
+;; (let a (Add
+;; 	(Div (Add s one) 2)
+;; 	(Div (Add (Neg s) one) 2))
+;; )
+;; (run 10)
+;; (extract a)
+;; (pop)
+;; 
+;; ;; (let a10 (Add zero one))
+;; ;; (let a12 (Add one two))
+;; ;;
+;; ;; (run 10)
+;; ;;
+;; ;; (check (= a10 one))
+;; ;; (check (= a12 (Num 3)))
+;
+
+;; (let a (Mul one two))
+;; (run 20)
+;; (extract a)
+
+(let a (Var "a"))
+(let term (Div (Add a one) 4))
+(let mul1 (Mul (Add (Mul term two) (Num -3)) (Add term mone)))
+(let mul2 (Mul (Add term mone) (Add (Mul term two) (Num -3))))
+(let x (Add mul1 (Mul mul2 mone)))
+(run 10)
+(extract x)

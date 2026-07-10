@@ -1,0 +1,49 @@
+#![allow(clippy::len_zero)]
+
+use tract_nnef::internal::*;
+
+pub mod grid_sample;
+pub mod lrn;
+pub mod ml;
+pub mod multinomial;
+pub mod non_max_suppression;
+pub mod random;
+pub mod resize;
+
+pub trait WithOnnx {
+    fn with_onnx(self) -> Self;
+    fn enable_onnx(&mut self);
+}
+
+impl WithOnnx for tract_nnef::framework::Nnef {
+    fn enable_onnx(&mut self) {
+        self.registries.push(onnx_opl_registry());
+    }
+    fn with_onnx(mut self) -> Self {
+        self.enable_onnx();
+        self
+    }
+}
+
+pub fn onnx_opl_registry() -> Registry {
+    let mut registry: Registry = Registry::new("tract_onnx")
+        .with_doc(
+            "Extension `tract_onnx` extends NNEF for supporting some corner case ONNX operators.",
+        )
+        .with_doc("")
+        .with_doc("Add `extension tract_onnx` to `graph.nnef`");
+    grid_sample::register(&mut registry);
+    ml::register(&mut registry);
+    non_max_suppression::register(&mut registry);
+    multinomial::register(&mut registry);
+    random::register(&mut registry);
+    resize::register(&mut registry);
+    registry.register_dumper(lrn::dump);
+    registry.register_primitive(
+        "tract_onnx_lrn",
+        &lrn::parameters(),
+        &[("output", TypeName::Scalar.tensor())],
+        lrn::load,
+    );
+    registry
+}

@@ -1,0 +1,24 @@
+{
+  "name": "deep_filter",
+  "type": "module",
+  "collaborators": [
+    "Hendrik Schröter"
+  ],
+  "description": "Noise supression using deep filtering",
+  "version": "0.5.7-pre",
+  "license": "MIT/Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Rikorose/DeepFilterNet"
+  },
+  "files": [
+    "deep_filter_bg.wasm",
+    "deep_filter.js",
+    "deep_filter.d.ts"
+  ],
+  "main": "deep_filter.js",
+  "types": "deep_filter.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

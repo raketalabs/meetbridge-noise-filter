@@ -1,0 +1,10 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["MeetbridgeNoiseFilterModule"],
+    "podspecPath": "./ios/MeetbridgeNoiseFilter.podspec"
+  },
+  "android": {
+    "modules": ["com.meetbridge.noisefilter.MeetbridgeNoiseFilterModule"]
+  }
+}

@@ -1,0 +1,5 @@
+MeetBridge Noise Filter React Native includes DeepFilterNet (libDF) by Hendrik
+Schroeter and contributors of the Rikorose DeepFilterNet project.
+
+DeepFilterNet is made available under the MIT and Apache-2.0 licenses. Copies
+of the applicable licenses are retained in the MeetBridge source vendor tree.

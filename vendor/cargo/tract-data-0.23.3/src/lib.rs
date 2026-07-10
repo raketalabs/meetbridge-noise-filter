@@ -1,0 +1,65 @@
+#![allow(clippy::len_zero)]
+#![allow(clippy::missing_safety_doc)]
+
+pub extern crate itertools;
+
+#[macro_use]
+mod macros;
+
+/// A Smallvec instantiation with 4 embeddable values.
+///
+/// Used about everywhere in tract, for node inputs and outputs, or
+/// tensor dimensions.
+pub type TVec<T> = smallvec::SmallVec<[T; 4]>;
+
+pub type TractError = anyhow::Error;
+pub type TractResult<T> = anyhow::Result<T>;
+
+pub mod prelude {
+    pub use crate::TVec;
+    pub use crate::blob::Blob;
+    pub use crate::datum::{Datum, DatumType, QParams, round_ties_to_even};
+    pub use crate::dim::{Assertion, Symbol, SymbolScope, SymbolValues, TDim, ToDim};
+    pub use crate::tensor::litteral::*;
+    pub use crate::tensor::plain_view::{PlainView, PlainViewMut};
+    pub use crate::tensor::storage::{PlainStorage, TensorStorage};
+    pub use crate::tensor::{IntoArcTensor, IntoTensor, Tensor, natural_strides};
+    #[cfg(feature = "complex")]
+    pub use crate::tensor::{reinterpret_complex_as_inner_dim, reinterpret_inner_dim_as_complex};
+    pub use crate::tvec;
+    pub use crate::{TractError, TractResult};
+    pub use crate::{
+        dispatch_copy, dispatch_copy_by_size, dispatch_datum, dispatch_datum_by_size,
+        dispatch_floatlike, dispatch_hash, dispatch_numbers, dispatch_signed,
+    };
+    pub use half::f16;
+    pub use itertools as tract_itertools;
+    #[cfg(feature = "complex")]
+    pub use num_complex::Complex;
+}
+
+pub mod internal {
+    pub use crate::datum::ClampCast;
+    pub use crate::dim::{DimLike, parse_tdim, solve_for};
+    pub use crate::exotic::ExoticFact;
+    pub use crate::prelude::*;
+    pub use crate::tensor::Approximation;
+    pub use crate::tensor::view::TensorView;
+    pub use crate::tensor::{clip_range_bounds, vector_size};
+    pub use anyhow::{Context as TractErrorContext, anyhow, bail, ensure, format_err};
+    pub use ndarray as tract_ndarray;
+    pub use num_integer;
+    pub use num_traits as tract_num_traits;
+    pub use smallvec as tract_smallvec;
+    pub type StaticName = std::borrow::Cow<'static, str>;
+}
+
+pub use dim::TooEarly;
+pub use half;
+
+mod blob;
+mod datum;
+mod dim;
+mod exotic;
+mod scatter;
+mod tensor;

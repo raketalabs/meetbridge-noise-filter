@@ -1,0 +1,13 @@
+node_modules/
+*.tgz
+.DS_Store
+
+# Core compilation scratch space. Versioned release artifacts live outside
+# these directories and are intentionally committed.
+vendor/deepfilternet/libDF/target/
+packages/core-build/.cargo/.global-cache
+packages/core-build/.cargo/.package-cache*
+artifacts/android/wrapper-*/
+artifacts/ios/cargo/
+artifacts/ios/headers/
+artifacts/ios/libdf-simulator.a

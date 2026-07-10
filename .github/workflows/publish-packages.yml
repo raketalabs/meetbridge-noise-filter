@@ -1,0 +1,36 @@
+name: Publish prebuilt noise-filter packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      npm_tag:
+        description: GitHub Packages dist-tag
+        required: true
+        default: latest
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+          scope: '@raketalabs'
+      - name: Verify committed artifacts
+        run: node scripts/verify-prebuilt-artifacts.mjs
+      - name: Publish Web and Electron package
+        run: npm publish ./packages/noise-filter-web --access restricted --tag "${{ inputs.npm_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish React Native package
+        run: npm publish ./packages/noise-filter-react-native --access restricted --tag "${{ inputs.npm_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

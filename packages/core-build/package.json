@@ -1,0 +1,12 @@
+{
+  "name": "@meetbridge/core-build",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Offline DeepFilterNet3 build orchestration for MeetBridge packages",
+  "scripts": {
+    "verify-vendor": "node ../../scripts/verify-deepfilternet-vendor.mjs",
+    "wasm": "bash ./scripts/build-wasm.sh",
+    "android": "bash ./scripts/build-android.sh",
+    "ios": "bash ./scripts/build-ios.sh"
+  }
+}

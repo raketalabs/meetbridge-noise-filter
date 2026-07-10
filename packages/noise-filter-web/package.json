@@ -1,0 +1,50 @@
+{
+  "name": "@raketalabs/meetbridge-noise-filter-web",
+  "version": "0.2.0",
+  "description": "Client-side DeepFilterNet3 audio processor for LiveKit browsers and Electron",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/raketalabs/meetbridge-noise-filter.git",
+    "directory": "packages/noise-filter-web"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "restricted"
+  },
+  "meetbridgeCore": {
+    "deepFilterNet": "3",
+    "tract": "0.23.3",
+    "artifactPolicy": "prebuilt from the committed vendored core; consumers do not run Cargo"
+  },
+  "sideEffects": false,
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "meetbridge-stage-noise-filter-assets": "./bin/stage-assets.mjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "bin",
+    "dist",
+    "NOTICE",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/build-noise-filter-web.mjs",
+    "check": "node ../../scripts/verify-deepfilternet-vendor.mjs"
+  },
+  "peerDependencies": {
+    "livekit-client": ">=2.18.0 <3"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "name": "@raketalabs/meetbridge-noise-filter-react-native",
+  "version": "0.2.0",
+  "description": "Expo-native DeepFilterNet3 capture post-processor for LiveKit",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/raketalabs/meetbridge-noise-filter.git",
+    "directory": "packages/noise-filter-react-native"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "restricted"
+  },
+  "meetbridgeCore": {
+    "deepFilterNet": "3",
+    "tract": "0.23.3",
+    "artifactPolicy": "prebuilt from the committed vendored core; consumers do not run Cargo"
+  },
+  "main": "./src/index.ts",
+  "react-native": "./src/index.ts",
+  "types": "./src/index.ts",
+  "files": [
+    "src",
+    "android",
+    "ios",
+    "models",
+    "app.plugin.js",
+    "expo-module.config.json",
+    "NOTICE",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@livekit/react-native": ">=2.10.0 <3",
+    "expo-modules-core": ">=1.0.0",
+    "livekit-client": ">=2.18.0 <3",
+    "react-native": ">=0.73.0"
+  },
+  "scripts": {
+    "check": "node ../../scripts/verify-deepfilternet-vendor.mjs"
+  }
+}

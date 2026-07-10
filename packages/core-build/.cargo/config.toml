@@ -1,0 +1,13 @@
+[net]
+offline = true
+
+[source.crates-io]
+replace-with = "meetbridge-vendored-sources"
+
+[source."git+https://github.com/aldanor/hdf5-rust.git?rev=26046fb"]
+git = "https://github.com/aldanor/hdf5-rust.git"
+rev = "26046fb"
+replace-with = "meetbridge-vendored-sources"
+
+[source.meetbridge-vendored-sources]
+directory = "../../vendor/cargo"

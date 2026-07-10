@@ -1,0 +1,19 @@
+--- data/src/tensor.rs
++++ data/src/tensor.rs
+@@ -173,12 +173,14 @@ pub fn vector_size() -> usize {
+ impl Tensor {
+     #[inline]
+     fn dense_storage(&self) -> &DenseStorage {
+-        self.storage.as_dense().expect("Non-dense storage")
++        // Safety: all Tensor constructors create StorageKind::Dense
++        unsafe { self.storage.as_dense_unchecked() }
+     }
+ 
+     #[inline]
+     fn dense_storage_mut(&mut self) -> &mut DenseStorage {
+-        self.storage.as_dense_mut().expect("Non-dense storage")
++        // Safety: all Tensor constructors create StorageKind::Dense
++        unsafe { self.storage.as_dense_mut_unchecked() }
+     }
+ 
+     /// Returns an immutable [`DenseView`] if this tensor has dense storage.

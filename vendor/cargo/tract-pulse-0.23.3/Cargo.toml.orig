@@ -1,0 +1,25 @@
+[package]
+name = "tract-pulse"
+version = "0.23.3"
+license = "MIT OR Apache-2.0"
+authors = ["Mathieu Poumeyrol <kali@zoy.org>"]
+description = "Tiny, no-nonsense, self contained, TensorFlow and ONNX inference"
+repository = "https://github.com/snipsco/tract"
+keywords = [ "TensorFlow", "NeuralNetworks" ]
+categories = [ "science" ]
+autobenches = false
+edition = "2024"
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[dependencies]
+downcast-rs.workspace = true
+dyn-eq.workspace = true
+erased-serde.workspace = true
+lazy_static.workspace = true
+log.workspace = true
+serde.workspace = true
+tract-pulse-opl.workspace = true
+tract-transformers.workspace = true
+
