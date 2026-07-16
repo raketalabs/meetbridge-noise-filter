@@ -6,6 +6,7 @@ import java.lang.reflect.InvocationHandler
 import java.lang.reflect.Proxy
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 import kotlin.math.min
 
@@ -18,7 +19,7 @@ data class NativeFilterStats(
 
 class DeepFilterCaptureProcessor(private val context: Context) {
   private var refCount = 0
-  private var enabled = true
+  @Volatile private var enabled = true
   private var nativeHandle = 0L
   private var processorProxy: Any? = null
   private var controller: Any? = null
@@ -28,7 +29,16 @@ class DeepFilterCaptureProcessor(private val context: Context) {
   private var averageFrameTimeMs = 0.0
   private var processedFrames = 0
   private var droppedFrames = 0
+  private var guardFrameCount = 0
+  private var rollingFrameTimeMs = 0.0
+  private var overDeadlineStreak = 0
+  private var sustainedHighAverageFrames = 0
+  private var autoBypassFrames = 0
+  private var recoveryWarmupFrames = 0
+  private var autoBypassed = false
+  private var rawInputBytes = ByteArray(480 * 8 * 2)
   private val overload = AtomicBoolean(false)
+  private val enableTransition = AtomicInteger(0)
   private var nativeLibraryLoaded = false
 
   fun availability(): Map<String, Any> {
@@ -58,6 +68,13 @@ class DeepFilterCaptureProcessor(private val context: Context) {
   fun acquire(enabled: Boolean, suppressionLevel: Int) {
     val available = availability()["supported"] as? Boolean ?: false
     check(available) { availability()["reason"] as? String ?: "DeepFilterNet3 is unavailable." }
+    if (refCount == 0) {
+      if (nativeHandle != 0L) {
+        nativeFree(nativeHandle)
+        nativeHandle = 0L
+      }
+      resetRuntimeState()
+    }
     this.enabled = enabled
     if (nativeHandle == 0L) {
       nativeHandle = nativeCreate(copyModelAsset().absolutePath, levelToAttenuation(suppressionLevel))
@@ -83,7 +100,25 @@ class DeepFilterCaptureProcessor(private val context: Context) {
   }
 
   fun setEnabled(enabled: Boolean) {
+    val wasEnabled = this.enabled
     this.enabled = enabled
+    if (enabled != wasEnabled) enableTransition.set(if (enabled) 1 else -1)
+  }
+
+  private fun applyPendingEnableTransition() {
+    when (enableTransition.getAndSet(0)) {
+      1 -> {
+        autoBypassed = false
+        autoBypassFrames = 0
+        recoveryWarmupFrames = 20
+        resetOverloadGuard()
+      }
+      -1 -> {
+        autoBypassed = false
+        autoBypassFrames = 0
+        recoveryWarmupFrames = 0
+      }
+    }
   }
 
   fun setSuppressionLevel(suppressionLevel: Int) {
@@ -145,19 +180,102 @@ class DeepFilterCaptureProcessor(private val context: Context) {
   }
 
   private fun processAudio(numFrames: Int, buffer: ByteBuffer?) {
+    applyPendingEnableTransition()
     if (!enabled || nativeHandle == 0L || buffer == null || sampleRate != 48_000 || numFrames != 480) return
+    if (autoBypassed) {
+      autoBypassFrames += 1
+      if (autoBypassFrames < 100) return
+      autoBypassed = false
+      autoBypassFrames = 0
+      recoveryWarmupFrames = 20
+      resetOverloadGuard()
+    }
     val startedAt = System.nanoTime()
+    val shouldUseFilteredOutput = recoveryWarmupFrames <= 0
+    val rawByteCount = numFrames * channelCount * 2
+    if (!captureRawInput(buffer, rawByteCount)) {
+      droppedFrames += 1
+      return
+    }
     val processed = nativeProcess(nativeHandle, buffer, numFrames, channelCount)
     if (!processed) {
+      restoreRawInput(buffer, rawByteCount)
       droppedFrames += 1
       return
     }
     val frameTimeMs = (System.nanoTime() - startedAt) / 1_000_000.0
     processedFrames += 1
     averageFrameTimeMs += (frameTimeMs - averageFrameTimeMs) / processedFrames
-    if (frameTimeMs > 8.0 || averageFrameTimeMs > 8.0) {
-      enabled = false
+    guardFrameCount += 1
+    rollingFrameTimeMs = if (guardFrameCount == 1) {
+      frameTimeMs
+    } else {
+      rollingFrameTimeMs * 0.95 + frameTimeMs * 0.05
+    }
+    overDeadlineStreak = if (frameTimeMs > 9.5) overDeadlineStreak + 1 else 0
+    sustainedHighAverageFrames = if (guardFrameCount > 100 && rollingFrameTimeMs > 8.0) {
+      sustainedHighAverageFrames + 1
+    } else {
+      0
+    }
+    val sustainedOverload = guardFrameCount > 100
+      && (overDeadlineStreak >= 8 || sustainedHighAverageFrames >= 50)
+    if (!shouldUseFilteredOutput || sustainedOverload) restoreRawInput(buffer, rawByteCount)
+    if (recoveryWarmupFrames > 0) recoveryWarmupFrames -= 1
+    if (sustainedOverload) {
+      autoBypassed = true
+      autoBypassFrames = 0
       overload.set(true)
+    }
+  }
+
+  private fun resetOverloadGuard() {
+    guardFrameCount = 0
+    rollingFrameTimeMs = 0.0
+    overDeadlineStreak = 0
+    sustainedHighAverageFrames = 0
+  }
+
+  private fun resetRuntimeState() {
+    averageFrameTimeMs = 0.0
+    processedFrames = 0
+    droppedFrames = 0
+    overload.set(false)
+    enableTransition.set(0)
+    autoBypassed = false
+    autoBypassFrames = 0
+    recoveryWarmupFrames = 0
+    resetOverloadGuard()
+  }
+
+  private fun captureRawInput(buffer: ByteBuffer, byteCount: Int): Boolean {
+    if (byteCount <= 0 || buffer.capacity() < byteCount) return false
+    if (rawInputBytes.size < byteCount) rawInputBytes = ByteArray(byteCount)
+    val originalPosition = buffer.position()
+    val originalLimit = buffer.limit()
+    return try {
+      buffer.limit(buffer.capacity())
+      buffer.position(0)
+      buffer.get(rawInputBytes, 0, byteCount)
+      true
+    } finally {
+      buffer.position(0)
+      buffer.limit(originalLimit)
+      buffer.position(originalPosition)
+    }
+  }
+
+  private fun restoreRawInput(buffer: ByteBuffer, byteCount: Int) {
+    val originalPosition = buffer.position()
+    val originalLimit = buffer.limit()
+    try {
+      buffer.limit(buffer.capacity())
+      buffer.position(0)
+      buffer.put(rawInputBytes, 0, byteCount)
+    } finally {
+      buffer.position(0)
+      buffer.limit(originalLimit)
+      buffer.position(originalPosition)
     }
   }
 

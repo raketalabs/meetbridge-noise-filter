@@ -21,8 +21,8 @@
       "sha256": "c94d91f70911001c946e0fabb4aa9adc37045f45a03b56008cb0c8244cb63616"
     },
     "artifacts/ios/MeetbridgeDeepFilter.xcframework/Info.plist": {
-      "bytes": 1256,
-      "sha256": "1aaa3a049b7929c95b3a3497196758b5e16b290018ef13976c1e0a79cda0a042"
+      "bytes": 1236,
+      "sha256": "325f3f566ce7802e8aba52a5d6e52c69cb1de75c44bd707bd99b29a71b7cd5a6"
     },
     "artifacts/ios/MeetbridgeDeepFilter.xcframework/ios-arm64/Headers/MeetbridgeDeepFilter.h": {
       "bytes": 388,
@@ -36,7 +36,7 @@
       "bytes": 388,
       "sha256": "589825018e7b0f91fc8f639a858aa49f1400d54b3d0fd51c840c5043c059d130"
     },
-    "artifacts/ios/MeetbridgeDeepFilter.xcframework/ios-arm64_x86_64-simulator/libdf-simulator.a": {
+    "artifacts/ios/MeetbridgeDeepFilter.xcframework/ios-arm64_x86_64-simulator/libdf.a": {
       "bytes": 112000232,
       "sha256": "43dc835b59b26652a8b73b107cab0d0614b94f952afa23a8e40dd530354fd4d5"
     },
@@ -104,9 +104,13 @@
       "bytes": 561048,
       "sha256": "6a04e626ec7915462265c076c78a3dc7c6ff3a44bb486970282abd3c1919599a"
     },
+    "packages/noise-filter-react-native/ios/DeepFilterNet3_onnx.tar.gz": {
+      "bytes": 7983136,
+      "sha256": "c94d91f70911001c946e0fabb4aa9adc37045f45a03b56008cb0c8244cb63616"
+    },
     "packages/noise-filter-react-native/ios/MeetbridgeDeepFilter.xcframework/Info.plist": {
-      "bytes": 1256,
-      "sha256": "1aaa3a049b7929c95b3a3497196758b5e16b290018ef13976c1e0a79cda0a042"
+      "bytes": 1236,
+      "sha256": "325f3f566ce7802e8aba52a5d6e52c69cb1de75c44bd707bd99b29a71b7cd5a6"
     },
     "packages/noise-filter-react-native/ios/MeetbridgeDeepFilter.xcframework/ios-arm64/Headers/MeetbridgeDeepFilter.h": {
       "bytes": 388,
@@ -120,7 +124,7 @@
       "bytes": 388,
       "sha256": "589825018e7b0f91fc8f639a858aa49f1400d54b3d0fd51c840c5043c059d130"
     },
-    "packages/noise-filter-react-native/ios/MeetbridgeDeepFilter.xcframework/ios-arm64_x86_64-simulator/libdf-simulator.a": {
+    "packages/noise-filter-react-native/ios/MeetbridgeDeepFilter.xcframework/ios-arm64_x86_64-simulator/libdf.a": {
       "bytes": 112000232,
       "sha256": "43dc835b59b26652a8b73b107cab0d0614b94f952afa23a8e40dd530354fd4d5"
     },

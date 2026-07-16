@@ -18,7 +18,7 @@ public final class MeetbridgeNoiseFilterModule: Module {
     AsyncFunction("acquire") { (options: [String: Any]) in
       let enabled = options["enabled"] as? Bool ?? true
       let suppressionLevel = options["suppressionLevel"] as? Int ?? 80
-      self.processor.enabled = enabled
+      self.processor.isEnabled = enabled
       self.processor.setSuppressionLevel(suppressionLevel)
       if !self.attached {
         LKAudioProcessingManager.sharedInstance().addCapturePostProcessor(self.processor)
@@ -36,7 +36,7 @@ public final class MeetbridgeNoiseFilterModule: Module {
     }
 
     AsyncFunction("setEnabled") { (enabled: Bool) in
-      self.processor.enabled = enabled
+      self.processor.isEnabled = enabled
     }
 
     AsyncFunction("setSuppressionLevel") { (suppressionLevel: Int) in

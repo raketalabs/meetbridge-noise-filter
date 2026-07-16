@@ -39,6 +39,7 @@
     "react-native": ">=0.73.0"
   },
   "scripts": {
+    "prepack": "node ./scripts/stage-ios-model.mjs",
     "check": "node ../../scripts/verify-deepfilternet-vendor.mjs"
   }
 }

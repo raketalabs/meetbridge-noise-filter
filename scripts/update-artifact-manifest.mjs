@@ -13,6 +13,7 @@ const roots = [
   'packages/noise-filter-web/dist/assets',
   'packages/noise-filter-react-native/android/src/main/assets/DeepFilterNet3_onnx.tar.gz',
   'packages/noise-filter-react-native/android/src/main/jniLibs',
+  'packages/noise-filter-react-native/ios/DeepFilterNet3_onnx.tar.gz',
   'packages/noise-filter-react-native/ios/MeetbridgeDeepFilter.xcframework',
   'packages/noise-filter-react-native/models',
 ]

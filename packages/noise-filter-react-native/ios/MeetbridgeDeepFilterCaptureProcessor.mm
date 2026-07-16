@@ -1,6 +1,7 @@
 #import "MeetbridgeDeepFilterCaptureProcessor.h"
 #import "MeetbridgeDeepFilter.h"
 #import <QuartzCore/QuartzCore.h>
+#import <algorithm>
 #import <atomic>
 #import <vector>
 
@@ -10,10 +11,21 @@ float attenuationForLevel(NSInteger level) {
 }
 
 NSString* modelPath() {
-  NSBundle* classBundle = [NSBundle bundleForClass:[MBDeepFilterCaptureProcessor class]];
-  NSURL* resourceBundleURL = [classBundle URLForResource:@"MeetbridgeNoiseFilterResources" withExtension:@"bundle"];
-  NSBundle* resourceBundle = resourceBundleURL ? [NSBundle bundleWithURL:resourceBundleURL] : classBundle;
-  return [resourceBundle pathForResource:@"DeepFilterNet3_onnx" ofType:@"tar.gz"];
+  NSArray<NSBundle*>* containerBundles = @[
+    [NSBundle bundleForClass:[MBDeepFilterCaptureProcessor class]],
+    [NSBundle mainBundle]
+  ];
+  for (NSBundle* containerBundle in containerBundles) {
+    NSURL* resourceBundleURL = [containerBundle URLForResource:@"MeetbridgeNoiseFilterResources" withExtension:@"bundle"];
+    if (resourceBundleURL) {
+      NSBundle* resourceBundle = [NSBundle bundleWithURL:resourceBundleURL];
+      NSString* bundledPath = [resourceBundle pathForResource:@"DeepFilterNet3_onnx" ofType:@"tar.gz"];
+      if (bundledPath) return bundledPath;
+    }
+    NSString* directPath = [containerBundle pathForResource:@"DeepFilterNet3_onnx" ofType:@"tar.gz"];
+    if (directPath) return directPath;
+  }
+  return nil;
 }
 }
 
@@ -24,9 +36,17 @@ NSString* modelPath() {
   std::vector<float> _output;
   std::atomic_bool _enabled;
   std::atomic_bool _overload;
-  std::atomic_double _averageFrameTimeMs;
+  std::atomic<double> _averageFrameTimeMs;
   std::atomic_int _processedFrames;
   std::atomic_int _droppedFrames;
+  std::atomic_int _enableTransition;
+  NSInteger _guardFrameCount;
+  double _rollingFrameTimeMs;
+  NSInteger _overDeadlineStreak;
+  NSInteger _sustainedHighAverageFrames;
+  NSInteger _autoBypassFrames;
+  NSInteger _recoveryWarmupFrames;
+  BOOL _autoBypassed;
   NSInteger _suppressionLevel;
 }
 
@@ -40,6 +60,14 @@ NSString* modelPath() {
     _averageFrameTimeMs.store(0);
     _processedFrames.store(0);
     _droppedFrames.store(0);
+    _enableTransition.store(0);
+    _guardFrameCount = 0;
+    _rollingFrameTimeMs = 0;
+    _overDeadlineStreak = 0;
+    _sustainedHighAverageFrames = 0;
+    _autoBypassFrames = 0;
+    _recoveryWarmupFrames = 0;
+    _autoBypassed = NO;
     _suppressionLevel = 80;
   }
   return self;
@@ -50,7 +78,8 @@ NSString* modelPath() {
 }
 
 - (void)setEnabled:(BOOL)enabled {
-  _enabled.store(enabled);
+  const BOOL wasEnabled = _enabled.exchange(enabled);
+  if (enabled != wasEnabled) _enableTransition.store(enabled ? 1 : -1);
 }
 
 - (void)setSuppressionLevel:(NSInteger)level {
@@ -91,6 +120,14 @@ NSString* modelPath() {
   _averageFrameTimeMs.store(0);
   _processedFrames.store(0);
   _droppedFrames.store(0);
+  _enableTransition.store(0);
+  _guardFrameCount = 0;
+  _rollingFrameTimeMs = 0;
+  _overDeadlineStreak = 0;
+  _sustainedHighAverageFrames = 0;
+  _autoBypassFrames = 0;
+  _recoveryWarmupFrames = 0;
+  _autoBypassed = NO;
 #endif
 }
 
@@ -98,7 +135,32 @@ NSString* modelPath() {
 #if !defined(MEETBRIDGE_DEEPFILTER_AVAILABLE)
   return;
 #else
+  const int enableTransition = _enableTransition.exchange(0);
+  if (enableTransition > 0) {
+    _autoBypassed = NO;
+    _autoBypassFrames = 0;
+    _recoveryWarmupFrames = 20;
+    _guardFrameCount = 0;
+    _rollingFrameTimeMs = 0;
+    _overDeadlineStreak = 0;
+    _sustainedHighAverageFrames = 0;
+  } else if (enableTransition < 0) {
+    _autoBypassed = NO;
+    _autoBypassFrames = 0;
+    _recoveryWarmupFrames = 0;
+  }
   if (!_enabled.load() || !_state || audioBuffer.frames != 480 || audioBuffer.channels < 1) return;
+  if (_autoBypassed) {
+    _autoBypassFrames += 1;
+    if (_autoBypassFrames < 100) return;
+    _autoBypassed = NO;
+    _autoBypassFrames = 0;
+    _recoveryWarmupFrames = 20;
+    _guardFrameCount = 0;
+    _rollingFrameTimeMs = 0;
+    _overDeadlineStreak = 0;
+    _sustainedHighAverageFrames = 0;
+  }
   CFTimeInterval startedAt = CACurrentMediaTime();
   const NSInteger channels = MIN(_channels, static_cast<NSInteger>(audioBuffer.channels));
   for (NSInteger frame = 0; frame < 480; frame += 1) {
@@ -106,21 +168,39 @@ NSString* modelPath() {
     for (NSInteger channel = 0; channel < channels; channel += 1) {
       mixed += [audioBuffer rawBufferForChannel:static_cast<int>(channel)][frame];
     }
-    _input[frame] = mixed / static_cast<float>(channels);
+    const float mixedS16 = mixed / static_cast<float>(channels);
+    _input[frame] = std::clamp(mixedS16 / 32768.0f, -1.0f, 1.0f);
   }
   df_process_frame(_state, _input.data(), _output.data());
-  for (NSInteger channel = 0; channel < channels; channel += 1) {
-    float* destination = [audioBuffer rawBufferForChannel:static_cast<int>(channel)];
-    for (NSInteger frame = 0; frame < 480; frame += 1) destination[frame] = _output[frame];
-  }
   const double elapsedMs = (CACurrentMediaTime() - startedAt) * 1000.0;
   const int count = _processedFrames.fetch_add(1) + 1;
   const double previous = _averageFrameTimeMs.load();
   const double average = previous + (elapsedMs - previous) / count;
   _averageFrameTimeMs.store(average);
-  if (elapsedMs > 8.0 || average > 8.0) {
-    _enabled.store(false);
+  _guardFrameCount += 1;
+  _rollingFrameTimeMs = _guardFrameCount == 1
+    ? elapsedMs
+    : _rollingFrameTimeMs * 0.95 + elapsedMs * 0.05;
+  _overDeadlineStreak = elapsedMs > 9.5 ? _overDeadlineStreak + 1 : 0;
+  _sustainedHighAverageFrames = _guardFrameCount > 100 && _rollingFrameTimeMs > 8.0
+    ? _sustainedHighAverageFrames + 1
+    : 0;
+  const BOOL sustainedOverload = _guardFrameCount > 100
+    && (_overDeadlineStreak >= 8 || _sustainedHighAverageFrames >= 50);
+  if (sustainedOverload) {
+    _autoBypassed = YES;
+    _autoBypassFrames = 0;
     _overload.store(true);
+  }
+  const BOOL shouldUseFilteredOutput = !_autoBypassed && _recoveryWarmupFrames <= 0;
+  if (_recoveryWarmupFrames > 0) _recoveryWarmupFrames -= 1;
+  if (shouldUseFilteredOutput) {
+    for (NSInteger channel = 0; channel < channels; channel += 1) {
+      float* destination = [audioBuffer rawBufferForChannel:static_cast<int>(channel)];
+      for (NSInteger frame = 0; frame < 480; frame += 1) {
+        destination[frame] = std::clamp(_output[frame], -1.0f, 1.0f) * 32767.0f;
+      }
+    }
   }
 #endif
 }
