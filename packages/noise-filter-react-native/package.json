@@ -1,6 +1,6 @@
 {
   "name": "@raketalabs/meetbridge-noise-filter-react-native",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Expo-native DeepFilterNet3 capture post-processor for LiveKit",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -24,7 +24,6 @@
     "src",
     "android",
     "ios",
-    "models",
     "app.plugin.js",
     "expo-module.config.json",
     "NOTICE",

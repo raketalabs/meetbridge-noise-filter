@@ -3,11 +3,12 @@ apply plugin: 'expo-module-gradle-plugin'
 apply plugin: 'org.jetbrains.kotlin.android'
 
 group = 'com.meetbridge'
-version = '0.2.0'
+version = '0.2.1'
 
 android {
   namespace 'com.meetbridge.noisefilter'
   defaultConfig {
+    versionName project.version.toString()
     minSdkVersion 24
     consumerProguardFiles 'consumer-rules.pro'
   }

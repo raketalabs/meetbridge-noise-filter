@@ -1,6 +1,6 @@
 {
   "name": "@raketalabs/meetbridge-noise-filter-monorepo",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Versioned DeepFilterNet3 packages and prebuilt core artifacts for MeetBridge Web, Electron, Android, and iOS",
   "license": "MIT OR Apache-2.0",

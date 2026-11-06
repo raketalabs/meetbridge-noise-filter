@@ -108,40 +108,70 @@ export function canUseDeepFilterRuntime() {
     && typeof URL.createObjectURL === 'function'
 }
 
+const assetManifests = new Map<string, {
+  expiresAt: number
+  pending: Promise<ReturnType<typeof getDeepFilterAssetUrls>>
+}>()
+
+async function resolveDeepFilterAssets(assetBaseUrl?: string) {
+  const assets = getDeepFilterAssetUrls(assetBaseUrl)
+  const cached = assetManifests.get(assets.manifestUrl)
+  if (cached && cached.expiresAt > Date.now()) return cached.pending
+  const pending = (async () => {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 10_000)
+    try {
+      // Preflight reads only the small deployment manifest. The Worker owns
+      // the single validated model/WASM download when a microphone is used.
+      const response = await fetch(assets.manifestUrl, {
+        cache: 'no-cache', signal: controller.signal,
+      })
+      if (!response.ok) throw new Error(`Deployment manifest returned HTTP ${response.status}`)
+      const manifest = await response.json() as {
+        available?: unknown
+        files?: unknown
+        revisions?: Record<string, unknown>
+      }
+      const files = Array.isArray(manifest.files) ? manifest.files : []
+      const expectedFiles = ['deep_filter.js', 'deep_filter_bg.wasm', 'DeepFilterNet3_onnx.tar.gz.bin']
+      if (manifest.available !== true || !expectedFiles.every(file => files.includes(file))) {
+        throw new Error('WASM/model assets have not been staged')
+      }
+      const versioned = (url: string, file: string) => {
+        const revision = manifest.revisions?.[file]
+        return typeof revision === 'string' && /^[a-f0-9]{64}$/.test(revision)
+          ? `${url}?v=${revision}` : url
+      }
+      return {
+        ...assets,
+        moduleUrl: versioned(assets.moduleUrl, expectedFiles[0]),
+        wasmUrl: versioned(assets.wasmUrl, expectedFiles[1]),
+        modelUrl: versioned(assets.modelUrl, expectedFiles[2]),
+      }
+    } finally {
+      clearTimeout(timeout)
+    }
+  })()
+  assetManifests.set(assets.manifestUrl, { expiresAt: Date.now() + 60_000, pending })
+  try {
+    return await pending
+  } catch (error) {
+    if (assetManifests.get(assets.manifestUrl)?.pending === pending) assetManifests.delete(assets.manifestUrl)
+    throw error
+  }
+}
+
 export async function preflightDeepFilterRuntime(assetBaseUrl?: string) {
   if (!canUseDeepFilterRuntime()) {
     logRuntime('warn', 'UNAVAILABLE: this renderer does not support AudioWorklet, Worker, or WebAssembly.')
     return false
   }
-  const assets = getDeepFilterAssetUrls(assetBaseUrl)
   try {
-    // The committed manifest is an explicit deployment gate. It avoids noisy
-    // asset 404s in source-only checkouts and makes a partial copy fail closed.
-    const manifestResponse = await fetch(assets.manifestUrl, { cache: 'no-cache' })
-    if (!manifestResponse.ok) {
-      logRuntime('warn', `UNAVAILABLE: deployment manifest returned HTTP ${manifestResponse.status}.`, assets.manifestUrl)
-      return false
-    }
-    const manifest = await manifestResponse.json() as { available?: unknown, files?: unknown }
-    const manifestFiles = Array.isArray(manifest.files) ? manifest.files : []
-    const expectedFiles = ['deep_filter.js', 'deep_filter_bg.wasm', 'DeepFilterNet3_onnx.tar.gz.bin']
-    if (manifest.available !== true
-      || !expectedFiles.every(file => manifestFiles.includes(file))) {
-      logRuntime('warn', 'UNAVAILABLE: WASM/model artefacts have not been staged; browser noise suppression fallback remains active.', manifest)
-      return false
-    }
-
-    const responses = await Promise.all([
-      fetch(assets.moduleUrl, { cache: 'force-cache' }),
-      fetch(assets.wasmUrl, { cache: 'force-cache' }),
-      fetch(assets.modelUrl, { cache: 'force-cache' }),
-    ])
-    const ready = responses.every(response => response.ok)
-    if (ready) logRuntime('info', 'ASSETS READY: model and WASM passed preflight.', assets)
-    else logRuntime('warn', 'UNAVAILABLE: one or more staged assets could not be fetched.', responses.map(response => response.status))
-    return ready
+    const assets = await resolveDeepFilterAssets(assetBaseUrl)
+    logRuntime('info', 'ASSETS READY: deployment manifest validated; model and WASM load when the microphone starts.', assets)
+    return true
   } catch (error) {
-    logRuntime('error', 'UNAVAILABLE: preflight failed unexpectedly; using browser fallback.', error)
+    logRuntime('warn', 'UNAVAILABLE: asset manifest could not be prepared; using browser fallback.', error)
     return false
   }
 }
@@ -166,7 +196,6 @@ function workletBootstrap() {
     rawSlotCount = 8
     captureOffset = 0
     captureSequence = 0
-    activeCaptureSlot = -1
 
     slotBuffers: Array<Float32Array | null>
     freeSlotStack: Int16Array
@@ -308,7 +337,7 @@ function workletBootstrap() {
 
     acquireCaptureSlot() {
       if (!this.dataPort
-        || this.inFlight + this.queueDepth >= this.maxBacklog
+        || this.inFlight >= this.maxBacklog
         || this.freeSlotCount <= 0) return -1
       this.freeSlotCount -= 1
       return this.freeSlotStack[this.freeSlotCount]
@@ -391,17 +420,18 @@ function workletBootstrap() {
     beginCaptureFrame() {
       const rawIndex = this.captureSequence % this.rawSlotCount
       this.rawSequences[rawIndex] = this.captureSequence
-      this.activeCaptureSlot = this.acquireCaptureSlot()
     }
 
     finishCaptureFrame() {
       const sequence = this.captureSequence
-      const slotId = this.activeCaptureSlot
+      // Reserve a transferable slot only after capture is complete. A result
+      // that arrives during this hop can free capacity; deciding at hop start
+      // unnecessarily dropped the entire 10 ms frame. Ready playback results
+      // occupy their own bounded ring and must not block worker admission.
+      const slotId = this.acquireCaptureSlot()
       const buffer = slotId >= 0 ? this.slotBuffers[slotId] : null
-      if (slotId >= 0
-        && buffer
-        && this.dataPort
-        && this.inFlight + this.queueDepth < this.maxBacklog) {
+      if (slotId >= 0 && buffer && this.dataPort) {
+        buffer.set(this.rawFrames[sequence % this.rawSlotCount])
         const message = this.frameMessages[slotId]
         const transfer = this.frameTransfers[slotId]
         message.sequence = sequence
@@ -424,7 +454,6 @@ function workletBootstrap() {
         if (slotId >= 0) this.releaseCaptureSlot(slotId)
         this.droppedFrames += 1
       }
-      this.activeCaptureSlot = -1
       this.captureOffset = 0
       this.captureSequence += 1
 
@@ -432,7 +461,6 @@ function workletBootstrap() {
         this.playbackStarted = true
         this.playbackSequence = 0
         this.playbackOffset = 0
-        this.beginPlaybackFrame()
       }
     }
 
@@ -553,15 +581,14 @@ function workletBootstrap() {
         }
         const rawIndex = this.captureSequence % this.rawSlotCount
         this.rawFrames[rawIndex][this.captureOffset] = sample
-        if (this.activeCaptureSlot >= 0) {
-          const captureBuffer = this.slotBuffers[this.activeCaptureSlot]
-          if (captureBuffer) captureBuffer[this.captureOffset] = sample
-        }
         this.captureOffset += 1
         if (this.captureOffset >= this.sourceHop) this.finishCaptureFrame()
 
-        const next = this.playbackStarted ? this.renderPlaybackSample() : 0
+        // Choose the result at the first sample of its playback hop, not at
+        // the last sample of the preceding hop. Worker messages may arrive
+        // between render callbacks and still meet this frame's deadline.
         if (this.playbackStarted && this.playbackOffset === 0) this.beginPlaybackFrame()
+        const next = this.playbackStarted ? this.renderPlaybackSample() : 0
         for (let channel = 0; channel < output.length; channel += 1) output[channel][index] = next
       }
       this.emitTelemetryIfDue(outputLength)
@@ -582,7 +609,8 @@ function workerBootstrap() {
   let autoBypassed = false
   let autoBypassFrames = 0
   let recoveryWarmupFrames = 0
-  let modelInput: Float32Array<ArrayBufferLike> = new Float32Array(480)
+  const modelInput = new Float32Array(480)
+  let consecutiveProcessedFrames = 3
   let frameCount = 0
   let frameTimeTotal = 0
   let guardFrameCount = 0
@@ -611,28 +639,57 @@ function workerBootstrap() {
     return Math.sin(piValue) / piValue
   }
 
+  const resamplePlans = new Map<string, { indices: Int32Array, weights: Float32Array }>()
+
+  function getResamplePlan(inputLength: number, outputLength: number) {
+    const key = inputLength + ':' + outputLength
+    const existing = resamplePlans.get(key)
+    if (existing) return existing
+    const ratio = inputLength / outputLength
+    const cutoff = Math.min(1, outputLength / inputLength)
+    const halfTaps = 16
+    const taps = halfTaps * 2
+    const indices = new Int32Array(outputLength * taps)
+    const weights = new Float32Array(outputLength * taps)
+    for (let outputIndex = 0; outputIndex < outputLength; outputIndex += 1) {
+      const center = (outputIndex + 0.5) * ratio - 0.5
+      const left = Math.floor(center) - halfTaps + 1
+      let weightSum = 0
+      const offset = outputIndex * taps
+      for (let tap = 0; tap < taps; tap += 1) {
+        const sourceIndex = left + tap
+        if (sourceIndex < 0 || sourceIndex >= inputLength) continue
+        const distance = sourceIndex - center
+        const windowWeight = 0.5 + 0.5 * Math.cos(Math.PI * distance / halfTaps)
+        const weight = cutoff * sinc(distance * cutoff) * windowWeight
+        indices[offset + tap] = sourceIndex
+        weights[offset + tap] = weight
+        weightSum += weight
+      }
+      if (weightSum) {
+        for (let tap = 0; tap < taps; tap += 1) weights[offset + tap] /= weightSum
+      }
+    }
+    const plan = { indices, weights }
+    resamplePlans.set(key, plan)
+    return plan
+  }
+
   function resampleInto(input: Float32Array, output: Float32Array) {
     if (input.length === output.length) {
       output.set(input)
       return
     }
-    const ratio = input.length / output.length
-    const halfTaps = 16
+    // Each worker has a fixed capture rate. Cache its two coefficient tables
+    // instead of evaluating thousands of sin/cos functions every 10 ms.
+    const { indices, weights } = getResamplePlan(input.length, output.length)
     for (let outputIndex = 0; outputIndex < output.length; outputIndex += 1) {
-      const center = (outputIndex + 0.5) * ratio - 0.5
-      const left = Math.floor(center) - halfTaps + 1
+      const offset = outputIndex * 32
       let sum = 0
-      let weightSum = 0
-      for (let tap = 0; tap < halfTaps * 2; tap += 1) {
-        const sourceIndex = left + tap
-        if (sourceIndex < 0 || sourceIndex >= input.length) continue
-        const distance = sourceIndex - center
-        const windowWeight = 0.5 + 0.5 * Math.cos(Math.PI * distance / halfTaps)
-        const weight = sinc(distance) * windowWeight
-        sum += input[sourceIndex] * weight
-        weightSum += weight
+      for (let tap = 0; tap < 32; tap += 1) {
+        sum += input[indices[offset + tap]] * weights[offset + tap]
       }
-      output[outputIndex] = weightSum ? sum / weightSum : 0
+      output[outputIndex] = sum
     }
   }
 
@@ -655,24 +712,81 @@ function workerBootstrap() {
     })
   }
 
+  async function loadAssetBytes(url: string, kind: 'wasm' | 'model') {
+    // Versioned URLs are immutable content identities. Never persist legacy
+    // unversioned URLs, whose files can change underneath a deployment.
+    const revision = new URL(url).searchParams.get('v')
+    const versioned = Boolean(revision && /^[a-f0-9]{64}$/.test(revision))
+    const canVerify = versioned && typeof crypto !== 'undefined' && Boolean(crypto.subtle)
+    let cache: Cache | null = null
+    if (canVerify && typeof caches !== 'undefined') {
+      try {
+        cache = await caches.open('meetbridge-deepfilternet-assets-v1')
+      } catch {
+        // Private browsing, storage policy and quota must not prevent calls.
+      }
+    }
+    const valid = async (bytes: Uint8Array<ArrayBuffer>) => {
+      const headerValid = kind === 'wasm'
+        ? bytes[0] === 0 && bytes[1] === 0x61 && bytes[2] === 0x73 && bytes[3] === 0x6d
+        : bytes[0] === 0x1f && bytes[1] === 0x8b
+      if (!headerValid || !canVerify) return headerValid
+      const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
+      const actual = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('')
+      return actual === revision
+    }
+    if (cache) {
+      try {
+        const cached = await cache.match(url)
+        if (cached?.ok) {
+          const bytes = new Uint8Array(await cached.arrayBuffer())
+          if (await valid(bytes)) return bytes
+          await cache.delete(url)
+        }
+      } catch {
+        // Retry from HTTP if reading the persistent cache fails.
+      }
+    }
+    const response = await fetch(url, { cache: 'no-cache' })
+    if (!response.ok) throw new Error('DeepFilterNet3 ' + kind + ' asset returned HTTP ' + response.status)
+    const persistentResponse = cache ? response.clone() : null
+    const bytes = new Uint8Array(await response.arrayBuffer())
+    if (!await valid(bytes)) {
+      throw new Error('DeepFilterNet3 ' + kind + ' asset failed binary/revision verification; deploy matching manifest and assets and check Content-Encoding')
+    }
+    if (cache && persistentResponse) {
+      try {
+        await cache.put(url, persistentResponse)
+        // Keep one revision per asset path so package upgrades do not retain
+        // another full model indefinitely on storage-constrained devices.
+        const current = new URL(url)
+        for (const request of await cache.keys()) {
+          const previous = new URL(request.url)
+          if (previous.origin === current.origin && previous.pathname === current.pathname && request.url !== url) {
+            await cache.delete(request)
+          }
+        }
+      } catch {
+        // Cache writes are an optimisation; the validated bytes remain usable.
+      }
+    }
+    return bytes
+  }
+
   async function initialise(config: Record<string, any>) {
-    modelInput = new Float32Array(480)
     requestedEnabled = config.enabled !== false
     resetOverloadGuard()
-    phase = 'importing-bindings'
-    bindings = await workerScope.__meetbridgeImport(config.moduleUrl)
+    phase = 'loading-assets'
+    const [loadedBindings, wasmBytes, model] = await Promise.all([
+      workerScope.__meetbridgeImport(config.moduleUrl),
+      loadAssetBytes(config.wasmUrl, 'wasm'),
+      loadAssetBytes(config.modelUrl, 'model'),
+    ])
+    bindings = loadedBindings
     const initialiseWasm = bindings?.default || bindings?.init
     if (typeof initialiseWasm !== 'function') throw new Error('DeepFilterNet3 WASM init is unavailable')
     phase = 'initializing-wasm'
-    await initialiseWasm(config.wasmUrl)
-    phase = 'fetching-model'
-    const response = await fetch(config.modelUrl, { cache: 'force-cache' })
-    if (!response.ok) throw new Error('DeepFilterNet3 model asset is unavailable')
-    phase = 'reading-model'
-    const model = new Uint8Array(await response.arrayBuffer())
-    if (model[0] !== 0x1f || model[1] !== 0x8b) {
-      throw new Error('DeepFilterNet3 model response is not gzip-compressed; check Content-Encoding')
-    }
+    await initialiseWasm({ module_or_path: wasmBytes })
     phase = 'creating-state'
     const configuredLevel = Number(config.suppressionLevel)
     const suppressionLevel = Number.isFinite(configuredLevel)
@@ -680,6 +794,18 @@ function workerBootstrap() {
       : 70
     state = bindings?.df_create(model, toAttenuation(suppressionLevel))
     if (!state) throw new Error('DeepFilterNet3 state could not initialise')
+    if (bindings.df_get_frame_length(state) !== 480) {
+      throw new Error('DeepFilterNet3 requires a 480-sample core hop')
+    }
+    phase = 'warming-model'
+    // Pay cold inference and resampler setup costs before capture publication.
+    // Silent warmup preserves the three-hop alignment of the fresh stream.
+    for (let index = 0; index < 3; index += 1) bindings.df_process_frame(state, modelInput)
+    const sourceHop = Math.round(Number(config.sampleRate) / 100)
+    if (Number.isFinite(sourceHop) && sourceHop > 0 && sourceHop !== 480) {
+      getResamplePlan(sourceHop, 480)
+      getResamplePlan(480, sourceHop)
+    }
     phase = 'ready'
     postMessage({ type: 'ready', modelBytes: model.byteLength })
   }
@@ -704,6 +830,7 @@ function workerBootstrap() {
         returnRawFrame(data, input)
         return
       }
+      if (sequence !== lastSequence + 1) consecutiveProcessedFrames = 0
       lastSequence = sequence
 
       if (autoBypassed) {
@@ -719,15 +846,16 @@ function workerBootstrap() {
 
       const shouldProcess = requestedEnabled && !autoBypassed && Boolean(bindings) && Boolean(state)
       if (!shouldProcess || !bindings || !state) {
+        consecutiveProcessedFrames = 0
         returnRawFrame(data, input)
         return
       }
 
       phase = 'processing-frame'
       const startedAt = performance.now()
-      if (input.length === 480) modelInput = input
-      else resampleInto(input, modelInput)
-      const processed = bindings.df_process_frame(state, modelInput)
+      if (input.length !== 480) resampleInto(input, modelInput)
+      const processed = bindings.df_process_frame(state, input.length === 480 ? input : modelInput)
+      consecutiveProcessedFrames = Math.min(4, consecutiveProcessedFrames + 1)
       if (input.length === processed.length) input.set(processed)
       else resampleInto(processed, input)
       const frameTimeMs = performance.now() - startedAt
@@ -757,7 +885,10 @@ function workerBootstrap() {
         })
       }
 
-      let filtered = !autoBypassed && recoveryWarmupFrames <= 0
+      // DF3 retains three hops of delayed audio. After a dropped capture or
+      // bypass, those outputs belong to the previous timeline; keep aligned
+      // raw playback until three fresh consecutive inputs flush that delay.
+      let filtered = !autoBypassed && recoveryWarmupFrames <= 0 && consecutiveProcessedFrames > 3
       if (recoveryWarmupFrames > 0) {
         recoveryWarmupFrames -= 1
         filtered = false
@@ -787,6 +918,7 @@ function workerBootstrap() {
       const message = error instanceof Error ? error.message : String(error)
       const stack = error instanceof Error ? error.stack : undefined
       requestedEnabled = false
+      consecutiveProcessedFrames = 0
       if (!errorReported) {
         errorReported = true
         postMessage({ type: 'error', message, phase, stack })
@@ -847,7 +979,12 @@ async function installWorkletModule(audioContext: AudioContext) {
   if (!pending) {
     const source = sourceFromBootstrap(workletBootstrap)
     const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }))
-    pending = audioContext.audioWorklet.addModule(blobUrl).finally(() => URL.revokeObjectURL(blobUrl))
+    pending = audioContext.audioWorklet.addModule(blobUrl)
+      .catch(error => {
+        workletModules.delete(audioContext)
+        throw error
+      })
+      .finally(() => URL.revokeObjectURL(blobUrl))
     workletModules.set(audioContext, pending)
   }
   await pending
@@ -858,6 +995,7 @@ export async function createDeepFilterRuntimeNode(
   options: DeepFilterRuntimeOptions = {},
 ) {
   if (!canUseDeepFilterRuntime()) throw new Error('AudioWorklet or WebAssembly is unavailable')
+  const assets = await resolveDeepFilterAssets(options.assetBaseUrl)
   await installWorkletModule(audioContext)
   const latencyMode = resolveDeepFilterLatencyMode(options.latencyMode)
   const node = new AudioWorkletNode(audioContext, PROCESSOR_NAME, {
@@ -881,8 +1019,7 @@ export async function createDeepFilterRuntimeNode(
   const audioChannel = new MessageChannel()
   node.port.postMessage({ type: 'connect-worker', port: audioChannel.port1 }, [audioChannel.port1])
   worker.postMessage({ type: 'connect-worklet', port: audioChannel.port2 }, [audioChannel.port2])
-  const assets = getDeepFilterAssetUrls(options.assetBaseUrl)
-  logRuntime('info', 'INITIALISING: worker is loading the model before microphone publication.', {
+  logRuntime('info', 'INITIALISING: worker is loading the model for microphone processing.', {
     sampleRate: audioContext.sampleRate,
     assetBaseUrl: options.assetBaseUrl || DEFAULT_ASSET_BASE_URL,
     latencyMode,
@@ -959,7 +1096,8 @@ export async function createDeepFilterRuntimeNode(
       telemetry.processedFrames = Number(data.processedFrames || 0)
       telemetry.avgFrameTimeMs = Number(data.avgFrameTimeMs || 0)
       telemetry.p95FrameTimeMs = Number(data.p95FrameTimeMs || 0)
-      publishTelemetry()
+      // The worklet's five-second report publishes a single combined snapshot;
+      // worker timing updates must not log against stale fallback counters.
       return
     }
     if (data.type === 'overload') {
@@ -1003,19 +1141,28 @@ export async function createDeepFilterRuntimeNode(
     }
   }
 
+  const readyTimeout = setTimeout(() => {
+    fail(new Error('DeepFilterNet3 worker initialisation timed out after 60 seconds'))
+  }, 60_000)
   worker.postMessage({
     type: 'init',
     ...assets,
+    sampleRate: audioContext.sampleRate,
     enabled: options.enabled !== false,
     suppressionLevel: clampLevel(options.suppressionLevel),
   })
   try {
     await ready
   } catch (error) {
+    node.port.postMessage({ type: 'destroy' })
+    node.port.onmessage = null
+    node.port.close()
     worker.terminate()
     node.disconnect()
     URL.revokeObjectURL(workerUrl)
     throw error
+  } finally {
+    clearTimeout(readyTimeout)
   }
 
   controllers.set(node, {

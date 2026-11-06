@@ -32,6 +32,8 @@ public final class MeetbridgeNoiseFilterModule: Module {
       if self.leaseCount == 0 && self.attached {
         LKAudioProcessingManager.sharedInstance().removeCapturePostProcessor(self.processor)
         self.attached = false
+        // LiveKit removal waits for capture, but does not release the processor.
+        self.processor.audioProcessingRelease()
       }
     }
 

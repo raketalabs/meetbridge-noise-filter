@@ -19,6 +19,18 @@ All notable changes to this package are documented in this file.
   normalized DeepFilterNet3 range before inference, then clamp and scale model
   output back to float S16 for LiveKit encoding and local PCM renderers.
 
+## 0.2.1
+
+### Fixed
+
+- Serialize native lease acquisition, configuration, and release to avoid
+  leaking the shared capture processor during concurrent operations.
+- Apply suppression changes on the capture thread and guard Android state
+  lifetime without blocking the audio callback.
+- Release iOS model state on final detach and reduce per-sample bridge calls.
+- Omit the redundant staging-only model copy from the npm tarball; retain
+  models bundled for both Android and iOS and all prebuilt core artifacts.
+
 ## 0.2.0
 
 ### Changed

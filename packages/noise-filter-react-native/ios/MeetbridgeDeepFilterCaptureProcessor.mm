@@ -47,7 +47,8 @@ NSString* modelPath() {
   NSInteger _autoBypassFrames;
   NSInteger _recoveryWarmupFrames;
   BOOL _autoBypassed;
-  NSInteger _suppressionLevel;
+  std::atomic<NSInteger> _suppressionLevel;
+  NSInteger _appliedSuppressionLevel;
 }
 
 - (instancetype)init {
@@ -68,7 +69,8 @@ NSString* modelPath() {
     _autoBypassFrames = 0;
     _recoveryWarmupFrames = 0;
     _autoBypassed = NO;
-    _suppressionLevel = 80;
+    _suppressionLevel.store(80);
+    _appliedSuppressionLevel = 80;
   }
   return self;
 }
@@ -83,10 +85,8 @@ NSString* modelPath() {
 }
 
 - (void)setSuppressionLevel:(NSInteger)level {
-  _suppressionLevel = MAX(0, MIN(100, level));
-#if defined(MEETBRIDGE_DEEPFILTER_AVAILABLE)
-  if (_state) df_set_atten_lim(_state, attenuationForLevel(_suppressionLevel));
-#endif
+  // The core is mutable: only the capture callback may update a live state.
+  _suppressionLevel.store(MAX(0, MIN(100, level)));
 }
 
 - (NSDictionary<NSString*, id>*)availability {
@@ -104,11 +104,12 @@ NSString* modelPath() {
 #if !defined(MEETBRIDGE_DEEPFILTER_AVAILABLE)
   return;
 #else
+  [self audioProcessingRelease];
   if (sampleRateHz != 48000 || channels < 1) return;
   if ([[self availability][@"supported"] boolValue] == NO) return;
-  [self audioProcessingRelease];
   NSString* path = modelPath();
-  _state = df_create(path.UTF8String, attenuationForLevel(_suppressionLevel), nullptr);
+  _appliedSuppressionLevel = _suppressionLevel.load();
+  _state = df_create(path.UTF8String, attenuationForLevel(_appliedSuppressionLevel), nullptr);
   if (!_state || df_get_frame_length(_state) != 480) {
     if (_state) df_free(_state);
     _state = nullptr;
@@ -162,14 +163,22 @@ NSString* modelPath() {
     _sustainedHighAverageFrames = 0;
   }
   CFTimeInterval startedAt = CACurrentMediaTime();
+  const NSInteger suppressionLevel = _suppressionLevel.load();
+  if (suppressionLevel != _appliedSuppressionLevel) {
+    df_set_atten_lim(_state, attenuationForLevel(suppressionLevel));
+    _appliedSuppressionLevel = suppressionLevel;
+  }
   const NSInteger channels = MIN(_channels, static_cast<NSInteger>(audioBuffer.channels));
-  for (NSInteger frame = 0; frame < 480; frame += 1) {
-    float mixed = 0;
-    for (NSInteger channel = 0; channel < channels; channel += 1) {
-      mixed += [audioBuffer rawBufferForChannel:static_cast<int>(channel)][frame];
+  std::fill(_input.begin(), _input.end(), 0.0f);
+  for (NSInteger channel = 0; channel < channels; channel += 1) {
+    const float* source = [audioBuffer rawBufferForChannel:static_cast<int>(channel)];
+    for (NSInteger frame = 0; frame < 480; frame += 1) {
+      _input[frame] += source[frame];
     }
-    const float mixedS16 = mixed / static_cast<float>(channels);
-    _input[frame] = std::clamp(mixedS16 / 32768.0f, -1.0f, 1.0f);
+  }
+  const float normalization = 1.0f / (static_cast<float>(channels) * 32768.0f);
+  for (NSInteger frame = 0; frame < 480; frame += 1) {
+    _input[frame] = std::clamp(_input[frame] * normalization, -1.0f, 1.0f);
   }
   df_process_frame(_state, _input.data(), _output.data());
   const double elapsedMs = (CACurrentMediaTime() - startedAt) * 1000.0;

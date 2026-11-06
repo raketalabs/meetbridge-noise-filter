@@ -125,3 +125,19 @@ script copies them to `/deepfilternet/` for both Nuxt and Electron, where
 prepareDeepFilter verifies the manifest and all three files before capture.
 The renderer console reports `ASSETS READY`, `INITIALISING`, `ACTIVE`, and
 `TRACK ATTACHED` only after each corresponding stage succeeds.
+
+## Asset loading and caching (0.2.1)
+
+`prepareDeepFilter()` validates the small deployment manifest. The Worker
+validates and downloads the model/WASM only when processing starts. A failed
+initialization still rejects so the application can enable browser suppression.
+Staging adds per-file SHA-256 revisions; versioned WASM/model responses use
+CacheStorage when available, with ordinary HTTP fallback in restricted browsers.
+Existing manifests without revisions remain supported without persistent caching.
+
+The core/model are unchanged: the first microphone use still needs the 7.6 MiB
+gzip model and WASM. Serve the staged `.wasm.br`/`.wasm.gz` and JS sidecars with
+content negotiation to reduce WASM transfer. Never send `Content-Encoding: gzip`
+for `DeepFilterNet3_onnx.tar.gz.bin`; the core expects compressed model bytes.
+Revalidate `manifest.json` and unversioned assets. Immutable caching is safe only
+when the request revision matches the currently staged file.

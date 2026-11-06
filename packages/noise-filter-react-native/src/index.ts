@@ -55,6 +55,15 @@ export const fallbackAudioCaptureOptions: AudioCaptureOptions = {
 let nativeModule: NativeNoiseFilterModule | null | undefined
 let activeLeaseCount = 0
 let lastAvailabilityLog = ''
+let nativeOperation: Promise<unknown> = Promise.resolve()
+
+// A first acquire and a last release must be atomic relative to other leases.
+// Native calls yield to JS, so checking the count before awaiting is not enough.
+function serializeNativeOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const result = nativeOperation.then(operation)
+  nativeOperation = result.catch(() => undefined)
+  return result
+}
 
 function logAvailability(availability: NoiseFilterAvailability) {
   const message = availability.supported
@@ -128,13 +137,15 @@ export async function acquireNoiseFilterLease(options: {
 
   const enabled = options.enabled !== false
   const suppressionLevel = clampLevel(options.suppressionLevel)
-  if (activeLeaseCount === 0) {
-    await native.acquire({ enabled, suppressionLevel })
-  } else {
-    await native.setEnabled(enabled)
-    await native.setSuppressionLevel(suppressionLevel)
-  }
-  activeLeaseCount += 1
+  await serializeNativeOperation(async () => {
+    if (activeLeaseCount === 0) {
+      await native.acquire({ enabled, suppressionLevel })
+    } else {
+      await native.setEnabled(enabled)
+      await native.setSuppressionLevel(suppressionLevel)
+    }
+    activeLeaseCount += 1
+  })
   console.info('[MeetBridge DeepFilterNet3] NATIVE ACTIVE: LiveKit capture post-processing is filtering microphone audio.', {
     platform: Platform.OS,
     suppressionLevel,
@@ -142,26 +153,31 @@ export async function acquireNoiseFilterLease(options: {
   })
   let released = false
 
-  const release = async () => {
+  const release = () => serializeNativeOperation(async () => {
     if (released) return
-    released = true
-    activeLeaseCount = Math.max(0, activeLeaseCount - 1)
-    if (activeLeaseCount === 0) {
+    if (activeLeaseCount === 1) {
       await native.release()
       console.info('[MeetBridge DeepFilterNet3] NATIVE DETACHED: microphone capture post-processing was released.')
     }
-  }
+    // Keep the lease retryable if native detachment fails.
+    activeLeaseCount = Math.max(0, activeLeaseCount - 1)
+    released = true
+  })
 
   return {
-    async setEnabled(nextEnabled: boolean) {
-      if (!released) {
-        const enabled = Boolean(nextEnabled)
-        await native.setEnabled(enabled)
-        console.info(`[MeetBridge DeepFilterNet3] NATIVE ${enabled ? 'ENABLED' : 'BYPASS'}: microphone processing state updated.`)
-      }
+    setEnabled(nextEnabled: boolean) {
+      return serializeNativeOperation(async () => {
+        if (!released) {
+          const enabled = Boolean(nextEnabled)
+          await native.setEnabled(enabled)
+          console.info(`[MeetBridge DeepFilterNet3] NATIVE ${enabled ? 'ENABLED' : 'BYPASS'}: microphone processing state updated.`)
+        }
+      })
     },
-    async setSuppressionLevel(nextLevel: number) {
-      if (!released) await native.setSuppressionLevel(clampLevel(nextLevel))
+    setSuppressionLevel(nextLevel: number) {
+      return serializeNativeOperation(async () => {
+        if (!released) await native.setSuppressionLevel(clampLevel(nextLevel))
+      })
     },
     async getStats() {
       return native.getStats()

@@ -7,6 +7,8 @@ import java.lang.reflect.Proxy
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.math.max
 import kotlin.math.min
 
@@ -20,15 +22,17 @@ data class NativeFilterStats(
 class DeepFilterCaptureProcessor(private val context: Context) {
   private var refCount = 0
   @Volatile private var enabled = true
-  private var nativeHandle = 0L
+  @Volatile private var nativeHandle = 0L
+  private val stateLock = ReentrantLock()
+  private val pendingSuppressionLevel = AtomicInteger(-1)
   private var processorProxy: Any? = null
   private var controller: Any? = null
   private var setCapturePostProcessor: java.lang.reflect.Method? = null
-  private var sampleRate = 48_000
-  private var channelCount = 1
-  private var averageFrameTimeMs = 0.0
+  @Volatile private var sampleRate = 48_000
+  @Volatile private var channelCount = 1
+  @Volatile private var averageFrameTimeMs = 0.0
   private var processedFrames = 0
-  private var droppedFrames = 0
+  @Volatile private var droppedFrames = 0
   private var guardFrameCount = 0
   private var rollingFrameTimeMs = 0.0
   private var overDeadlineStreak = 0
@@ -36,12 +40,12 @@ class DeepFilterCaptureProcessor(private val context: Context) {
   private var autoBypassFrames = 0
   private var recoveryWarmupFrames = 0
   private var autoBypassed = false
-  private var rawInputBytes = ByteArray(480 * 8 * 2)
+  private val rawInputBytes = ByteArray(480 * 8 * 2)
   private val overload = AtomicBoolean(false)
   private val enableTransition = AtomicInteger(0)
   private var nativeLibraryLoaded = false
 
-  fun availability(): Map<String, Any> {
+  @Synchronized fun availability(): Map<String, Any> {
     if (!loadNativeLibrary()) {
       return mapOf(
         "supported" to false,
@@ -65,34 +69,47 @@ class DeepFilterCaptureProcessor(private val context: Context) {
     }
   }
 
-  fun acquire(enabled: Boolean, suppressionLevel: Int) {
-    val available = availability()["supported"] as? Boolean ?: false
-    check(available) { availability()["reason"] as? String ?: "DeepFilterNet3 is unavailable." }
+  @Synchronized fun acquire(enabled: Boolean, suppressionLevel: Int) {
+    val availability = availability()
+    check(availability["supported"] == true) { availability["reason"] as? String ?: "DeepFilterNet3 is unavailable." }
     if (refCount == 0) {
-      if (nativeHandle != 0L) {
-        nativeFree(nativeHandle)
-        nativeHandle = 0L
+      stateLock.withLock {
+        freeNativeState()
+        resetRuntimeState()
+        this.enabled = enabled
+        nativeHandle = nativeCreate(copyModelAsset().absolutePath, levelToAttenuation(suppressionLevel))
+        check(nativeHandle != 0L) { "DeepFilterNet3 native state could not initialise." }
+        pendingSuppressionLevel.set(-1)
       }
-      resetRuntimeState()
+      try {
+        installCapturePostProcessor()
+      } catch (error: Throwable) {
+        stateLock.withLock { freeNativeState() }
+        throw error
+      }
+    } else {
+      setEnabled(enabled)
+      setSuppressionLevel(suppressionLevel)
     }
-    this.enabled = enabled
-    if (nativeHandle == 0L) {
-      nativeHandle = nativeCreate(copyModelAsset().absolutePath, levelToAttenuation(suppressionLevel))
-      check(nativeHandle != 0L) { "DeepFilterNet3 native state could not initialise." }
-    }
-    nativeSetAttenuation(nativeHandle, levelToAttenuation(suppressionLevel))
-    if (refCount == 0) installCapturePostProcessor()
     refCount += 1
   }
 
-  fun release() {
-    refCount = max(0, refCount - 1)
-    if (refCount == 0) uninstallCapturePostProcessor()
+  @Synchronized fun release() {
+    if (refCount <= 0) return
+    if (refCount == 1) {
+      uninstallCapturePostProcessor()
+      stateLock.withLock { freeNativeState() }
+    }
+    refCount -= 1
   }
 
-  fun destroy() {
-    refCount = 0
+  @Synchronized fun destroy() {
     uninstallCapturePostProcessor()
+    stateLock.withLock { freeNativeState() }
+    refCount = 0
+  }
+
+  private fun freeNativeState() {
     if (nativeHandle != 0L) {
       nativeFree(nativeHandle)
       nativeHandle = 0L
@@ -122,7 +139,8 @@ class DeepFilterCaptureProcessor(private val context: Context) {
   }
 
   fun setSuppressionLevel(suppressionLevel: Int) {
-    if (nativeHandle != 0L) nativeSetAttenuation(nativeHandle, levelToAttenuation(suppressionLevel))
+    // The capture thread owns all mutations of a live core state.
+    pendingSuppressionLevel.set(min(100, max(0, suppressionLevel)))
   }
 
   fun stats() = NativeFilterStats(
@@ -180,8 +198,23 @@ class DeepFilterCaptureProcessor(private val context: Context) {
   }
 
   private fun processAudio(numFrames: Int, buffer: ByteBuffer?) {
+    // Teardown may wait for inference; the real-time callback never waits for
+    // model creation or teardown and leaves the original PCM untouched.
+    if (!stateLock.tryLock()) return
+    try {
+      processAudioLocked(numFrames, buffer)
+    } finally {
+      stateLock.unlock()
+    }
+  }
+
+  private fun processAudioLocked(numFrames: Int, buffer: ByteBuffer?) {
     applyPendingEnableTransition()
     if (!enabled || nativeHandle == 0L || buffer == null || sampleRate != 48_000 || numFrames != 480) return
+    if (channelCount !in 1..8 || !buffer.isDirect || buffer.isReadOnly) {
+      droppedFrames += 1
+      return
+    }
     if (autoBypassed) {
       autoBypassFrames += 1
       if (autoBypassFrames < 100) return
@@ -191,6 +224,8 @@ class DeepFilterCaptureProcessor(private val context: Context) {
       resetOverloadGuard()
     }
     val startedAt = System.nanoTime()
+    val suppressionLevel = pendingSuppressionLevel.getAndSet(-1)
+    if (suppressionLevel >= 0) nativeSetAttenuation(nativeHandle, levelToAttenuation(suppressionLevel))
     val shouldUseFilteredOutput = recoveryWarmupFrames <= 0
     val rawByteCount = numFrames * channelCount * 2
     if (!captureRawInput(buffer, rawByteCount)) {
@@ -249,8 +284,7 @@ class DeepFilterCaptureProcessor(private val context: Context) {
   }
 
   private fun captureRawInput(buffer: ByteBuffer, byteCount: Int): Boolean {
-    if (byteCount <= 0 || buffer.capacity() < byteCount) return false
-    if (rawInputBytes.size < byteCount) rawInputBytes = ByteArray(byteCount)
+    if (byteCount <= 0 || byteCount > rawInputBytes.size || buffer.capacity() < byteCount) return false
     val originalPosition = buffer.position()
     val originalLimit = buffer.limit()
     return try {

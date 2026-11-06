@@ -3,8 +3,10 @@
 ## Normal package release
 
 A normal TypeScript, Worker, AudioWorklet, Expo plugin, or wrapper change does
-not require rebuilding DeepFilterNet3. Update the package version, rebuild only
-the Web package when its TypeScript changed, inspect the diff, and publish the
+not require rebuilding DeepFilterNet3. Update the package version and keep the
+committed Web JavaScript/types in sync with source. Run the Web package build
+only when explicitly authorized; otherwise edit the committed distribution
+files directly and omit stale source maps. Inspect the diff and publish the
 already committed files. Native consumers link the committed binaries.
 
 The GitHub Actions publish workflow deliberately does not compile the core. It

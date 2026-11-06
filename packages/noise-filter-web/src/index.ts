@@ -95,6 +95,7 @@ export class DeepFilterProcessor extends EventTarget {
   private runtimeNode: AudioWorkletNode | null = null
   private destinationNode: MediaStreamAudioDestinationNode | null = null
   private destroyed = false
+  private connectionId = 0
   private enabled: boolean
   private suppressionLevel: number
   private readonly assetBaseUrl?: string
@@ -173,20 +174,44 @@ export class DeepFilterProcessor extends EventTarget {
         'Use recommendedAudioCaptureOptions to prevent double suppression and speech distortion.',
       )
     }
+    const connectionId = ++this.connectionId
+    let runtime: AudioWorkletNode | null = null
+    let source: MediaStreamAudioSourceNode | null = null
+    let destination: MediaStreamAudioDestinationNode | null = null
+    const current = () => !this.destroyed && connectionId === this.connectionId
+    const cleanup = () => {
+      source?.disconnect()
+      runtime?.disconnect()
+      destination?.disconnect()
+      destination?.stream.getTracks().forEach(track => track.stop())
+      if (runtime) controlDeepFilterRuntimeNode(runtime)?.destroy()
+    }
     try {
-      this.sourceNode = options.audioContext.createMediaStreamSource(new MediaStream([options.track]))
-      this.destinationNode = options.audioContext.createMediaStreamDestination()
-      this.runtimeNode = await createDeepFilterRuntimeNode(options.audioContext, {
+      runtime = await createDeepFilterRuntimeNode(options.audioContext, {
         enabled: this.enabled,
         suppressionLevel: this.suppressionLevel,
         assetBaseUrl: this.assetBaseUrl,
         latencyMode: this.latencyMode,
-        onEvent: event => this.handleRuntimeEvent(event),
+        onEvent: event => { if (current()) this.handleRuntimeEvent(event) },
       })
-      this.sourceNode.connect(this.runtimeNode)
-      this.runtimeNode.connect(this.destinationNode)
-      await controlDeepFilterRuntimeNode(this.runtimeNode)?.waitUntilPrimed()
-      this.processedTrack = this.destinationNode.stream.getAudioTracks()[0]
+      if (!current()) {
+        cleanup()
+        throw new Error('DeepFilterNet3 connection was cancelled')
+      }
+      // Controls may have changed while assets/model initialization awaited.
+      const controller = controlDeepFilterRuntimeNode(runtime)
+      controller?.setEnabled(this.enabled)
+      controller?.setSuppressionLevel(this.suppressionLevel)
+      source = options.audioContext.createMediaStreamSource(new MediaStream([options.track]))
+      destination = options.audioContext.createMediaStreamDestination()
+      this.sourceNode = source
+      this.destinationNode = destination
+      this.runtimeNode = runtime
+      source.connect(runtime)
+      runtime.connect(destination)
+      await controller?.waitUntilPrimed()
+      if (!current()) throw new Error('DeepFilterNet3 connection was cancelled')
+      this.processedTrack = destination.stream.getAudioTracks()[0]
       console.info('[MeetBridge DeepFilterNet3] TRACK ATTACHED: processed microphone track is ready for LiveKit publication.', {
         sourceTrackId: options.track.id,
         sampleRate: options.audioContext.sampleRate,
@@ -194,9 +219,12 @@ export class DeepFilterProcessor extends EventTarget {
         algorithmicLatencyMs: this.stats.algorithmicLatencyMs,
       })
     } catch (error) {
-      await this.disconnectGraph()
+      cleanup()
       const normalized = error instanceof Error ? error : new Error(String(error))
-      this.dispatchEvent(new CustomEvent('error', { detail: normalized }))
+      if (current()) {
+        await this.disconnectGraph()
+        this.dispatchEvent(new CustomEvent('error', { detail: normalized }))
+      }
       throw normalized
     }
   }
@@ -226,10 +254,12 @@ export class DeepFilterProcessor extends EventTarget {
   }
 
   private async disconnectGraph() {
+    this.connectionId += 1
     const runtime = this.runtimeNode
     this.sourceNode?.disconnect()
     runtime?.disconnect()
     this.destinationNode?.disconnect()
+    this.destinationNode?.stream.getTracks().forEach(track => track.stop())
     if (runtime) controlDeepFilterRuntimeNode(runtime)?.destroy()
     this.sourceNode = null
     this.runtimeNode = null

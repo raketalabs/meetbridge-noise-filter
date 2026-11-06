@@ -86,36 +86,56 @@ function getDeepFilterAssetUrls(assetBaseUrl) {
 function canUseDeepFilterRuntime() {
   return typeof window !== "undefined" && typeof AudioWorkletNode !== "undefined" && typeof Worker !== "undefined" && typeof MessageChannel !== "undefined" && typeof WebAssembly !== "undefined" && typeof Blob !== "undefined" && typeof URL !== "undefined" && typeof URL.createObjectURL === "function";
 }
+const assetManifests = new Map();
+async function resolveDeepFilterAssets(assetBaseUrl) {
+  const assets = getDeepFilterAssetUrls(assetBaseUrl);
+  const cached = assetManifests.get(assets.manifestUrl);
+  if (cached && cached.expiresAt > Date.now()) return cached.pending;
+  const pending = (async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch(assets.manifestUrl, { cache: 'no-cache', signal: controller.signal });
+      if (!response.ok) throw new Error(`Deployment manifest returned HTTP ${response.status}`);
+      const manifest = await response.json();
+      const files = Array.isArray(manifest.files) ? manifest.files : [];
+      const expectedFiles = ['deep_filter.js', 'deep_filter_bg.wasm', 'DeepFilterNet3_onnx.tar.gz.bin'];
+      if (manifest.available !== true || !expectedFiles.every(file => files.includes(file))) {
+        throw new Error('WASM/model assets have not been staged');
+      }
+      const versioned = (url, file) => {
+        const revision = manifest.revisions?.[file];
+        return typeof revision === 'string' && /^[a-f0-9]{64}$/.test(revision) ? `${url}?v=${revision}` : url;
+      };
+      return {
+        ...assets,
+        moduleUrl: versioned(assets.moduleUrl, expectedFiles[0]),
+        wasmUrl: versioned(assets.wasmUrl, expectedFiles[1]),
+        modelUrl: versioned(assets.modelUrl, expectedFiles[2])
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  })();
+  assetManifests.set(assets.manifestUrl, { expiresAt: Date.now() + 60000, pending });
+  try {
+    return await pending;
+  } catch (error) {
+    if (assetManifests.get(assets.manifestUrl)?.pending === pending) assetManifests.delete(assets.manifestUrl);
+    throw error;
+  }
+}
 async function preflightDeepFilterRuntime(assetBaseUrl) {
   if (!canUseDeepFilterRuntime()) {
-    logRuntime("warn", "UNAVAILABLE: this renderer does not support AudioWorklet, Worker, or WebAssembly.");
+    logRuntime('warn', 'UNAVAILABLE: this renderer does not support AudioWorklet, Worker, or WebAssembly.');
     return false;
   }
-  const assets = getDeepFilterAssetUrls(assetBaseUrl);
   try {
-    const manifestResponse = await fetch(assets.manifestUrl, { cache: "no-cache" });
-    if (!manifestResponse.ok) {
-      logRuntime("warn", `UNAVAILABLE: deployment manifest returned HTTP ${manifestResponse.status}.`, assets.manifestUrl);
-      return false;
-    }
-    const manifest = await manifestResponse.json();
-    const manifestFiles = Array.isArray(manifest.files) ? manifest.files : [];
-    const expectedFiles = ["deep_filter.js", "deep_filter_bg.wasm", "DeepFilterNet3_onnx.tar.gz.bin"];
-    if (manifest.available !== true || !expectedFiles.every((file) => manifestFiles.includes(file))) {
-      logRuntime("warn", "UNAVAILABLE: WASM/model artefacts have not been staged; browser noise suppression fallback remains active.", manifest);
-      return false;
-    }
-    const responses = await Promise.all([
-      fetch(assets.moduleUrl, { cache: "force-cache" }),
-      fetch(assets.wasmUrl, { cache: "force-cache" }),
-      fetch(assets.modelUrl, { cache: "force-cache" })
-    ]);
-    const ready = responses.every((response) => response.ok);
-    if (ready) logRuntime("info", "ASSETS READY: model and WASM passed preflight.", assets);
-    else logRuntime("warn", "UNAVAILABLE: one or more staged assets could not be fetched.", responses.map((response) => response.status));
-    return ready;
+    const assets = await resolveDeepFilterAssets(assetBaseUrl);
+    logRuntime('info', 'ASSETS READY: deployment manifest validated; model and WASM load when the microphone starts.', assets);
+    return true;
   } catch (error) {
-    logRuntime("error", "UNAVAILABLE: preflight failed unexpectedly; using browser fallback.", error);
+    logRuntime('warn', 'UNAVAILABLE: asset manifest could not be prepared; using browser fallback.', error);
     return false;
   }
 }
@@ -138,7 +158,6 @@ function workletBootstrap() {
     rawSlotCount = 8;
     captureOffset = 0;
     captureSequence = 0;
-    activeCaptureSlot = -1;
     slotBuffers;
     freeSlotStack;
     freeSlotCount;
@@ -258,7 +277,7 @@ function workletBootstrap() {
       };
     }
     acquireCaptureSlot() {
-      if (!this.dataPort || this.inFlight + this.queueDepth >= this.maxBacklog || this.freeSlotCount <= 0) return -1;
+      if (!this.dataPort || this.inFlight >= this.maxBacklog || this.freeSlotCount <= 0) return -1;
       this.freeSlotCount -= 1;
       return this.freeSlotStack[this.freeSlotCount];
     }
@@ -329,13 +348,14 @@ function workletBootstrap() {
     beginCaptureFrame() {
       const rawIndex = this.captureSequence % this.rawSlotCount;
       this.rawSequences[rawIndex] = this.captureSequence;
-      this.activeCaptureSlot = this.acquireCaptureSlot();
     }
     finishCaptureFrame() {
       const sequence = this.captureSequence;
-      const slotId = this.activeCaptureSlot;
+      // Admit completed capture independently of the bounded playback queue.
+      const slotId = this.acquireCaptureSlot();
       const buffer = slotId >= 0 ? this.slotBuffers[slotId] : null;
-      if (slotId >= 0 && buffer && this.dataPort && this.inFlight + this.queueDepth < this.maxBacklog) {
+      if (slotId >= 0 && buffer && this.dataPort) {
+        buffer.set(this.rawFrames[sequence % this.rawSlotCount]);
         const message = this.frameMessages[slotId];
         const transfer = this.frameTransfers[slotId];
         message.sequence = sequence;
@@ -358,14 +378,12 @@ function workletBootstrap() {
         if (slotId >= 0) this.releaseCaptureSlot(slotId);
         this.droppedFrames += 1;
       }
-      this.activeCaptureSlot = -1;
       this.captureOffset = 0;
       this.captureSequence += 1;
       if (!this.playbackStarted && this.captureSequence >= this.primeHops) {
         this.playbackStarted = true;
         this.playbackSequence = 0;
         this.playbackOffset = 0;
-        this.beginPlaybackFrame();
       }
     }
     beginPlaybackFrame() {
@@ -463,14 +481,11 @@ function workletBootstrap() {
         }
         const rawIndex = this.captureSequence % this.rawSlotCount;
         this.rawFrames[rawIndex][this.captureOffset] = sample;
-        if (this.activeCaptureSlot >= 0) {
-          const captureBuffer = this.slotBuffers[this.activeCaptureSlot];
-          if (captureBuffer) captureBuffer[this.captureOffset] = sample;
-        }
         this.captureOffset += 1;
         if (this.captureOffset >= this.sourceHop) this.finishCaptureFrame();
-        const next = this.playbackStarted ? this.renderPlaybackSample() : 0;
+        // Decide at the first sample, after messages between render callbacks.
         if (this.playbackStarted && this.playbackOffset === 0) this.beginPlaybackFrame();
+        const next = this.playbackStarted ? this.renderPlaybackSample() : 0;
         for (let channel = 0; channel < output.length; channel += 1) output[channel][index] = next;
       }
       this.emitTelemetryIfDue(outputLength);
@@ -488,7 +503,8 @@ function workerBootstrap() {
   let autoBypassed = false;
   let autoBypassFrames = 0;
   let recoveryWarmupFrames = 0;
-  let modelInput = new Float32Array(480);
+  const modelInput = new Float32Array(480);
+  let consecutiveProcessedFrames = 3;
   let frameCount = 0;
   let frameTimeTotal = 0;
   let guardFrameCount = 0;
@@ -513,28 +529,53 @@ function workerBootstrap() {
     const piValue = Math.PI * value;
     return Math.sin(piValue) / piValue;
   }
+  const resamplePlans = new Map();
+  function getResamplePlan(inputLength, outputLength) {
+    const key = inputLength + ':' + outputLength;
+    const existing = resamplePlans.get(key);
+    if (existing) return existing;
+    const ratio = inputLength / outputLength;
+    const cutoff = Math.min(1, outputLength / inputLength);
+    const halfTaps = 16;
+    const taps = halfTaps * 2;
+    const indices = new Int32Array(outputLength * taps);
+    const weights = new Float32Array(outputLength * taps);
+    for (let outputIndex = 0; outputIndex < outputLength; outputIndex += 1) {
+      const center = (outputIndex + 0.5) * ratio - 0.5;
+      const left = Math.floor(center) - halfTaps + 1;
+      let weightSum = 0;
+      const offset = outputIndex * taps;
+      for (let tap = 0; tap < taps; tap += 1) {
+        const sourceIndex = left + tap;
+        if (sourceIndex < 0 || sourceIndex >= inputLength) continue;
+        const distance = sourceIndex - center;
+        const windowWeight = 0.5 + 0.5 * Math.cos(Math.PI * distance / halfTaps);
+        const weight = cutoff * sinc(distance * cutoff) * windowWeight;
+        indices[offset + tap] = sourceIndex;
+        weights[offset + tap] = weight;
+        weightSum += weight;
+      }
+      if (weightSum) {
+        for (let tap = 0; tap < taps; tap += 1) weights[offset + tap] /= weightSum;
+      }
+    }
+    const plan = { indices, weights };
+    resamplePlans.set(key, plan);
+    return plan;
+  }
   function resampleInto(input, output) {
     if (input.length === output.length) {
       output.set(input);
       return;
     }
-    const ratio = input.length / output.length;
-    const halfTaps = 16;
+    const { indices, weights } = getResamplePlan(input.length, output.length);
     for (let outputIndex = 0; outputIndex < output.length; outputIndex += 1) {
-      const center = (outputIndex + 0.5) * ratio - 0.5;
-      const left = Math.floor(center) - halfTaps + 1;
+      const offset = outputIndex * 32;
       let sum = 0;
-      let weightSum = 0;
-      for (let tap = 0; tap < halfTaps * 2; tap += 1) {
-        const sourceIndex = left + tap;
-        if (sourceIndex < 0 || sourceIndex >= input.length) continue;
-        const distance = sourceIndex - center;
-        const windowWeight = 0.5 + 0.5 * Math.cos(Math.PI * distance / halfTaps);
-        const weight = sinc(distance) * windowWeight;
-        sum += input[sourceIndex] * weight;
-        weightSum += weight;
+      for (let tap = 0; tap < 32; tap += 1) {
+        sum += input[indices[offset + tap]] * weights[offset + tap];
       }
-      output[outputIndex] = weightSum ? sum / weightSum : 0;
+      output[outputIndex] = sum;
     }
   }
   function processingP95() {
@@ -554,31 +595,93 @@ function workerBootstrap() {
       p95FrameTimeMs: processingP95()
     });
   }
+  async function loadAssetBytes(url, kind) {
+    const revision = new URL(url).searchParams.get('v');
+    const versioned = Boolean(revision && /^[a-f0-9]{64}$/.test(revision));
+    const canVerify = versioned && typeof crypto !== 'undefined' && Boolean(crypto.subtle);
+    let cache = null;
+    if (canVerify && typeof caches !== 'undefined') {
+      try {
+        cache = await caches.open('meetbridge-deepfilternet-assets-v1');
+      } catch {
+        // Storage restrictions do not prevent calls.
+      }
+    }
+    const valid = async (bytes) => {
+      const headerValid = kind === 'wasm'
+        ? bytes[0] === 0 && bytes[1] === 0x61 && bytes[2] === 0x73 && bytes[3] === 0x6d
+        : bytes[0] === 0x1f && bytes[1] === 0x8b;
+      if (!headerValid || !canVerify) return headerValid;
+      const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+      const actual = Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('');
+      return actual === revision;
+    };
+    if (cache) {
+      try {
+        const cached = await cache.match(url);
+        if (cached?.ok) {
+          const bytes = new Uint8Array(await cached.arrayBuffer());
+          if (await valid(bytes)) return bytes;
+          await cache.delete(url);
+        }
+      } catch {
+        // Retry through HTTP if persistent storage is unavailable.
+      }
+    }
+    const response = await fetch(url, { cache: 'no-cache' });
+    if (!response.ok) throw new Error('DeepFilterNet3 ' + kind + ' asset returned HTTP ' + response.status);
+    const persistentResponse = cache ? response.clone() : null;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (!await valid(bytes)) {
+      throw new Error('DeepFilterNet3 ' + kind + ' asset failed binary/revision verification; deploy matching manifest and assets and check Content-Encoding');
+    }
+    if (cache && persistentResponse) {
+      try {
+        await cache.put(url, persistentResponse);
+        const current = new URL(url);
+        for (const request of await cache.keys()) {
+          const previous = new URL(request.url);
+          if (previous.origin === current.origin && previous.pathname === current.pathname && request.url !== url) {
+            await cache.delete(request);
+          }
+        }
+      } catch {
+        // Validated bytes remain usable when cache writes fail.
+      }
+    }
+    return bytes;
+  }
   async function initialise(config) {
-    modelInput = new Float32Array(480);
     requestedEnabled = config.enabled !== false;
     resetOverloadGuard();
-    phase = "importing-bindings";
-    bindings = await workerScope.__meetbridgeImport(config.moduleUrl);
+    phase = 'loading-assets';
+    const [loadedBindings, wasmBytes, model] = await Promise.all([
+      workerScope.__meetbridgeImport(config.moduleUrl),
+      loadAssetBytes(config.wasmUrl, 'wasm'),
+      loadAssetBytes(config.modelUrl, 'model'),
+    ]);
+    bindings = loadedBindings;
     const initialiseWasm = bindings?.default || bindings?.init;
-    if (typeof initialiseWasm !== "function") throw new Error("DeepFilterNet3 WASM init is unavailable");
-    phase = "initializing-wasm";
-    await initialiseWasm(config.wasmUrl);
-    phase = "fetching-model";
-    const response = await fetch(config.modelUrl, { cache: "force-cache" });
-    if (!response.ok) throw new Error("DeepFilterNet3 model asset is unavailable");
-    phase = "reading-model";
-    const model = new Uint8Array(await response.arrayBuffer());
-    if (model[0] !== 31 || model[1] !== 139) {
-      throw new Error("DeepFilterNet3 model response is not gzip-compressed; check Content-Encoding");
-    }
-    phase = "creating-state";
+    if (typeof initialiseWasm !== 'function') throw new Error('DeepFilterNet3 WASM init is unavailable');
+    phase = 'initializing-wasm';
+    await initialiseWasm({ module_or_path: wasmBytes });
+    phase = 'creating-state';
     const configuredLevel = Number(config.suppressionLevel);
     const suppressionLevel = Number.isFinite(configuredLevel) ? configuredLevel : 70;
     state = bindings?.df_create(model, toAttenuation(suppressionLevel));
-    if (!state) throw new Error("DeepFilterNet3 state could not initialise");
-    phase = "ready";
-    postMessage({ type: "ready", modelBytes: model.byteLength });
+    if (!state) throw new Error('DeepFilterNet3 state could not initialise');
+    if (bindings.df_get_frame_length(state) !== 480) {
+      throw new Error('DeepFilterNet3 requires a 480-sample core hop');
+    }
+    phase = 'warming-model';
+    for (let index = 0; index < 3; index += 1) bindings.df_process_frame(state, modelInput);
+    const sourceHop = Math.round(Number(config.sampleRate) / 100);
+    if (Number.isFinite(sourceHop) && sourceHop > 0 && sourceHop !== 480) {
+      getResamplePlan(sourceHop, 480);
+      getResamplePlan(480, sourceHop);
+    }
+    phase = 'ready';
+    postMessage({ type: 'ready', modelBytes: model.byteLength });
   }
   function returnRawFrame(data, input) {
     dataPort?.postMessage({
@@ -599,6 +702,7 @@ function workerBootstrap() {
         returnRawFrame(data, input);
         return;
       }
+      if (sequence !== lastSequence + 1) consecutiveProcessedFrames = 0;
       lastSequence = sequence;
       if (autoBypassed) {
         autoBypassFrames += 1;
@@ -612,14 +716,15 @@ function workerBootstrap() {
       }
       const shouldProcess = requestedEnabled && !autoBypassed && Boolean(bindings) && Boolean(state);
       if (!shouldProcess || !bindings || !state) {
+        consecutiveProcessedFrames = 0;
         returnRawFrame(data, input);
         return;
       }
       phase = "processing-frame";
       const startedAt = performance.now();
-      if (input.length === 480) modelInput = input;
-      else resampleInto(input, modelInput);
-      const processed = bindings.df_process_frame(state, modelInput);
+      if (input.length !== 480) resampleInto(input, modelInput);
+      const processed = bindings.df_process_frame(state, input.length === 480 ? input : modelInput);
+      consecutiveProcessedFrames = Math.min(4, consecutiveProcessedFrames + 1);
       if (input.length === processed.length) input.set(processed);
       else resampleInto(processed, input);
       const frameTimeMs = performance.now() - startedAt;
@@ -643,7 +748,7 @@ function workerBootstrap() {
           overDeadlineStreak
         });
       }
-      let filtered = !autoBypassed && recoveryWarmupFrames <= 0;
+      let filtered = !autoBypassed && recoveryWarmupFrames <= 0 && consecutiveProcessedFrames > 3;
       if (recoveryWarmupFrames > 0) {
         recoveryWarmupFrames -= 1;
         filtered = false;
@@ -670,6 +775,7 @@ function workerBootstrap() {
       const message = error instanceof Error ? error.message : String(error);
       const stack = error instanceof Error ? error.stack : void 0;
       requestedEnabled = false;
+      consecutiveProcessedFrames = 0;
       if (!errorReported) {
         errorReported = true;
         postMessage({ type: "error", message, phase, stack });
@@ -727,13 +833,19 @@ async function installWorkletModule(audioContext) {
   if (!pending) {
     const source = sourceFromBootstrap(workletBootstrap);
     const blobUrl = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
-    pending = audioContext.audioWorklet.addModule(blobUrl).finally(() => URL.revokeObjectURL(blobUrl));
+    pending = audioContext.audioWorklet.addModule(blobUrl)
+      .catch((error) => {
+        workletModules.delete(audioContext);
+        throw error;
+      })
+      .finally(() => URL.revokeObjectURL(blobUrl));
     workletModules.set(audioContext, pending);
   }
   await pending;
 }
 async function createDeepFilterRuntimeNode(audioContext, options = {}) {
   if (!canUseDeepFilterRuntime()) throw new Error("AudioWorklet or WebAssembly is unavailable");
+  const assets = await resolveDeepFilterAssets(options.assetBaseUrl);
   await installWorkletModule(audioContext);
   const latencyMode = resolveDeepFilterLatencyMode(options.latencyMode);
   const node = new AudioWorkletNode(audioContext, PROCESSOR_NAME, {
@@ -753,8 +865,7 @@ async function createDeepFilterRuntimeNode(audioContext, options = {}) {
   const audioChannel = new MessageChannel();
   node.port.postMessage({ type: "connect-worker", port: audioChannel.port1 }, [audioChannel.port1]);
   worker.postMessage({ type: "connect-worklet", port: audioChannel.port2 }, [audioChannel.port2]);
-  const assets = getDeepFilterAssetUrls(options.assetBaseUrl);
-  logRuntime("info", "INITIALISING: worker is loading the model before microphone publication.", {
+  logRuntime("info", "INITIALISING: worker is loading the model for microphone processing.", {
     sampleRate: audioContext.sampleRate,
     assetBaseUrl: options.assetBaseUrl || DEFAULT_ASSET_BASE_URL,
     latencyMode,
@@ -828,7 +939,7 @@ async function createDeepFilterRuntimeNode(audioContext, options = {}) {
       telemetry.processedFrames = Number(data.processedFrames || 0);
       telemetry.avgFrameTimeMs = Number(data.avgFrameTimeMs || 0);
       telemetry.p95FrameTimeMs = Number(data.p95FrameTimeMs || 0);
-      publishTelemetry();
+      // Publish once, with the worklet's current fallback counters.
       return;
     }
     if (data.type === "overload") {
@@ -872,19 +983,28 @@ Worker: ${String(data.stack)}`;
       publishTelemetry();
     }
   };
+  const readyTimeout = setTimeout(() => {
+    fail(new Error('DeepFilterNet3 worker initialisation timed out after 60 seconds'));
+  }, 60000);
   worker.postMessage({
     type: "init",
     ...assets,
+    sampleRate: audioContext.sampleRate,
     enabled: options.enabled !== false,
     suppressionLevel: clampLevel(options.suppressionLevel)
   });
   try {
     await ready;
   } catch (error) {
+    node.port.postMessage({ type: 'destroy' });
+    node.port.onmessage = null;
+    node.port.close();
     worker.terminate();
     node.disconnect();
     URL.revokeObjectURL(workerUrl);
     throw error;
+  } finally {
+    clearTimeout(readyTimeout);
   }
   controllers.set(node, {
     setEnabled(enabled) {
@@ -1384,6 +1504,7 @@ var DeepFilterProcessor = class _DeepFilterProcessor extends EventTarget {
   runtimeNode = null;
   destinationNode = null;
   destroyed = false;
+  connectionId = 0;
   enabled;
   suppressionLevel;
   assetBaseUrl;
@@ -1452,20 +1573,43 @@ var DeepFilterProcessor = class _DeepFilterProcessor extends EventTarget {
         "[MeetBridge DeepFilterNet3] Browser noise suppression or voice isolation is enabled. Use recommendedAudioCaptureOptions to prevent double suppression and speech distortion."
       );
     }
+    const connectionId = ++this.connectionId;
+    let runtime = null;
+    let source = null;
+    let destination = null;
+    const current = () => !this.destroyed && connectionId === this.connectionId;
+    const cleanup = () => {
+      source?.disconnect();
+      runtime?.disconnect();
+      destination?.disconnect();
+      destination?.stream.getTracks().forEach(track => track.stop());
+      if (runtime) controlDeepFilterRuntimeNode(runtime)?.destroy();
+    };
     try {
-      this.sourceNode = options.audioContext.createMediaStreamSource(new MediaStream([options.track]));
-      this.destinationNode = options.audioContext.createMediaStreamDestination();
-      this.runtimeNode = await createDeepFilterRuntimeNode(options.audioContext, {
+      runtime = await createDeepFilterRuntimeNode(options.audioContext, {
         enabled: this.enabled,
         suppressionLevel: this.suppressionLevel,
         assetBaseUrl: this.assetBaseUrl,
         latencyMode: this.latencyMode,
-        onEvent: (event) => this.handleRuntimeEvent(event)
+        onEvent: (event) => { if (current()) this.handleRuntimeEvent(event); }
       });
-      this.sourceNode.connect(this.runtimeNode);
-      this.runtimeNode.connect(this.destinationNode);
-      await controlDeepFilterRuntimeNode(this.runtimeNode)?.waitUntilPrimed();
-      this.processedTrack = this.destinationNode.stream.getAudioTracks()[0];
+      if (!current()) {
+        cleanup();
+        throw new Error('DeepFilterNet3 connection was cancelled');
+      }
+      const controller = controlDeepFilterRuntimeNode(runtime);
+      controller?.setEnabled(this.enabled);
+      controller?.setSuppressionLevel(this.suppressionLevel);
+      source = options.audioContext.createMediaStreamSource(new MediaStream([options.track]));
+      destination = options.audioContext.createMediaStreamDestination();
+      this.sourceNode = source;
+      this.destinationNode = destination;
+      this.runtimeNode = runtime;
+      source.connect(runtime);
+      runtime.connect(destination);
+      await controller?.waitUntilPrimed();
+      if (!current()) throw new Error('DeepFilterNet3 connection was cancelled');
+      this.processedTrack = destination.stream.getAudioTracks()[0];
       console.info("[MeetBridge DeepFilterNet3] TRACK ATTACHED: processed microphone track is ready for LiveKit publication.", {
         sourceTrackId: options.track.id,
         sampleRate: options.audioContext.sampleRate,
@@ -1473,9 +1617,12 @@ var DeepFilterProcessor = class _DeepFilterProcessor extends EventTarget {
         algorithmicLatencyMs: this.stats.algorithmicLatencyMs
       });
     } catch (error) {
-      await this.disconnectGraph();
+      cleanup();
       const normalized = error instanceof Error ? error : new Error(String(error));
-      this.dispatchEvent(new CustomEvent("error", { detail: normalized }));
+      if (current()) {
+        await this.disconnectGraph();
+        this.dispatchEvent(new CustomEvent('error', { detail: normalized }));
+      }
       throw normalized;
     }
   }
@@ -1503,10 +1650,12 @@ var DeepFilterProcessor = class _DeepFilterProcessor extends EventTarget {
     this.dispatchEvent(new CustomEvent("error", { detail: event.error }));
   }
   async disconnectGraph() {
+    this.connectionId += 1;
     const runtime = this.runtimeNode;
     this.sourceNode?.disconnect();
     runtime?.disconnect();
     this.destinationNode?.disconnect();
+    this.destinationNode?.stream.getTracks().forEach(track => track.stop());
     if (runtime) controlDeepFilterRuntimeNode(runtime)?.destroy();
     this.sourceNode = null;
     this.runtimeNode = null;
@@ -1523,4 +1672,3 @@ async function createNoiseFilterNode(audioContext, options = {}) {
 function destroyNoiseFilterNode(node) {
   controlDeepFilterRuntimeNode(node)?.destroy();
 }
-//# sourceMappingURL=index.cjs.map

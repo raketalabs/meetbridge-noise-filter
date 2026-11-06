@@ -25,7 +25,7 @@ Visit **[meetbridge.co](https://meetbridge.co)** to learn about MeetBridge and i
 
 ## Overview
 
-Versioned DeepFilterNet3 integration packages with source code, model assets, and prebuilt platform artifacts. Release `0.2.0` uses DeepFilterNet3 at 48 kHz with tract `0.23.3`.
+Versioned DeepFilterNet3 integration packages with source code, model assets, and prebuilt platform artifacts. Release `0.2.1` uses DeepFilterNet3 at 48 kHz with tract `0.23.3`.
 
 The repository contains both the source needed to maintain the integration and the prebuilt binaries consumed by applications. Installing a released package does **not** build Rust and does not require Cargo, wasm-pack, cargo-ndk, CMake, or Xcode. Rebuilding the core is necessary only when DeepFilterNet/tract, Rust FFI code, compiler settings, or a native target changes.
 

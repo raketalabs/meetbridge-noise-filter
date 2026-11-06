@@ -32,6 +32,7 @@ export declare class DeepFilterProcessor extends EventTarget {
     private runtimeNode;
     private destinationNode;
     private destroyed;
+    private connectionId;
     private enabled;
     private suppressionLevel;
     private readonly assetBaseUrl?;

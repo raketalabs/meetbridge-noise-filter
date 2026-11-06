@@ -2,6 +2,21 @@
 
 All notable changes to this package are documented in this file.
 
+## 0.2.1
+
+### Fixed
+
+- Make preflight manifest-only; download model/WASM once in the Worker and
+  persist validated content-revision URLs in CacheStorage when available.
+- Stage SHA-256 revisions and precompressed WASM/JS sidecars, preserving the
+  model's original gzip bytes and retrying unavailable asset initialization.
+- Admit complete capture hops independently of buffered results and decide
+  fallback at the actual playback deadline; flush delayed output after gaps.
+- Use the supported wasm-bindgen object initializer and warm the Worker
+  before microphone publication. Keep inference off the render thread.
+- Clean up cancelled/restarted processor graphs and destination tracks.
+- Retain 48 kHz/480-sample core artifacts, bounded queues, and latency modes.
+
 ## 0.2.0
 
 ### Changed
