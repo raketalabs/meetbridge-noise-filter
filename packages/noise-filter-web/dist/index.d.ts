@@ -17,6 +17,10 @@ export interface DeepFilterStats {
 export interface DeepFilterProcessorOptions {
     suppressionLevel?: number;
     enabled?: boolean;
+    /** Gentle residual-noise attenuation (up to 1 dB). Defaults to true. */
+    postFilter?: boolean;
+    /** Soft attenuation during sustained quiet intervals (up to 3 dB). Defaults to true. */
+    pauseSuppression?: boolean;
     assetBaseUrl?: string;
     latencyMode?: DeepFilterLatencyMode;
 }
@@ -35,6 +39,8 @@ export declare class DeepFilterProcessor extends EventTarget {
     private connectionId;
     private enabled;
     private suppressionLevel;
+    private readonly postFilter;
+    private readonly pauseSuppression;
     private readonly assetBaseUrl?;
     private readonly latencyMode;
     private stats;

@@ -2,6 +2,18 @@
 
 All notable changes to this package are documented in this file.
 
+## 0.2.2
+
+### Changed
+
+- Add optional, default-on residual post-filter and soft pause suppression in
+  the Worker, capped at 1 dB and 3 dB respectively, with time-aligned energy
+  comparison, a 250 ms hold, gradual closing, and full-hop speech protection.
+- Route suppression level zero through aligned raw playback and warm the core
+  before re-enabling filtering, preserving the bounded audio timeline.
+- Keep the direct Worklet/Worker channel, existing core/model assets, and
+  published ESM/CommonJS entry points in sync without rebuilding the core.
+
 ## 0.2.1
 
 ### Fixed

@@ -51,6 +51,8 @@ raw first packet and preserves a browser fallback if assets cannot load.
 - DeepFilterProcessor accepts suppressionLevel from 0 to 100, enabled, and a
   latencyMode of low, balanced, or resilient. The defaults are suppression 70
   and low latency. Use balanced only on devices that show sustained underruns.
+- postFilter and pauseSuppression default to true. Either can be disabled in
+  the constructor or createNoiseFilterNode options independently.
 - setSuppressionLevel changes attenuation without rebuilding the graph.
 - setEnabled bypasses or reenables processing without rebuilding the graph;
   the audible transition is crossfaded.
@@ -93,6 +95,28 @@ DeepFilterNet3 hop.
 The estimated end-to-end algorithmic delay is 50 ms in low mode, 60 ms in
 balanced mode, and 70 ms in resilient mode. Inference remains in the Worker;
 the AudioWorklet render thread never waits for the model.
+
+## Gentle residual suppression
+
+The Worker applies a small broadband post-filter after inference, followed by
+soft attenuation during sustained quiet intervals. This wrapper implementation
+is shared in behavior with iOS and Android; it does not enable the core's
+spectral post-filter and requires no new model or core binary.
+
+Both stages require the filtered RMS to be at most -50 dBFS, its peak at most
+-38 dBFS, and at least 12 dB less energy than the time-aligned raw input. These
+conditions must hold for 250 ms before attenuation starts. The post-filter
+removes up to 1 dB; pause suppression adds up to 3 dB below -58 dBFS. Gain closes
+gradually over a 150 ms time constant and is interpolated within each hop.
+The combined reduction never exceeds 4 dB and never hard-mutes the microphone.
+
+Any frame outside those conservative conditions restores unity for the entire
+hop and restarts the hold, protecting possible speech onsets and tails. This
+is an energy heuristic, not a speech classifier. Bypass, warmup, frame gaps,
+and suppression-level changes reset its state. A suppressionLevel of zero
+uses the existing time-aligned raw path, avoiding the core's zero-delay bypass.
+To use only the model output, set both postFilter and pauseSuppression to false.
+The stages add no buffering delay or model download.
 
 ## Deepgram speech-gated PCM
 

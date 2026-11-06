@@ -3,9 +3,73 @@
 #import <QuartzCore/QuartzCore.h>
 #import <algorithm>
 #import <atomic>
+#import <cmath>
 #import <vector>
 
 namespace {
+constexpr size_t kFrameLength = 480;
+constexpr size_t kCoreDelayFrames = 3;
+constexpr size_t kRawRingSlots = kCoreDelayFrames + 1;
+
+// Only trim a quiet residual that the model has already strongly suppressed.
+// A possible speech onset restores unity for the entire hop, including its start.
+struct ResidualSuppression {
+  float postGain = 1.0f;
+  float pauseGain = 1.0f;
+  NSInteger holdFrames = 25;
+
+  void reset() {
+    postGain = 1.0f;
+    pauseGain = 1.0f;
+    holdFrames = 25;
+  }
+
+  void process(float* output, const float* delayedRaw, size_t channels,
+               bool postEnabled, bool pauseEnabled) {
+    double rawPower = 0;
+    double outputPower = 0;
+    float peak = 0;
+    const float normalization = 1.0f / (static_cast<float>(channels) * 32768.0f);
+    for (size_t frame = 0; frame < kFrameLength; frame += 1) {
+      float raw = 0;
+      for (size_t channel = 0; channel < channels; channel += 1) {
+        raw += delayedRaw[channel * kFrameLength + frame];
+      }
+      raw = std::clamp(raw * normalization, -1.0f, 1.0f);
+      rawPower += static_cast<double>(raw) * raw;
+      outputPower += static_cast<double>(output[frame]) * output[frame];
+      peak = std::max(peak, std::abs(output[frame]));
+    }
+    const double rawDb = 10.0 * std::log10(std::max(rawPower / kFrameLength, 1e-12));
+    const double outputDb = 10.0 * std::log10(std::max(outputPower / kFrameLength, 1e-12));
+    const double peakDb = 20.0 * std::log10(std::max(static_cast<double>(peak), 1e-6));
+    const double suppressionDb = rawDb - outputDb;
+    if (suppressionDb < 12.0 || outputDb > -50.0 || peakDb > -38.0) {
+      reset();
+      return;
+    }
+    if (holdFrames > 0) {
+      holdFrames -= 1;
+      return;
+    }
+    const float postTarget = postEnabled
+      ? static_cast<float>(std::pow(10.0, -std::clamp((suppressionDb - 12.0) / 12.0, 0.0, 1.0)
+          * std::clamp((-50.0 - outputDb) / 10.0, 0.0, 1.0) / 20.0))
+      : 1.0f;
+    const float pauseTarget = pauseEnabled
+      ? static_cast<float>(std::pow(10.0, -3.0 * std::clamp((-58.0 - outputDb) / 10.0, 0.0, 1.0) / 20.0))
+      : 1.0f;
+    const float previousGain = postGain * pauseGain;
+    postGain += (postTarget - postGain) * (postTarget < postGain ? 0.064493f : 0.864665f);
+    pauseGain += (pauseTarget - pauseGain) * (pauseTarget < pauseGain ? 0.064493f : 0.864665f);
+    const float nextGain = postGain * pauseGain;
+    for (size_t frame = 0; frame < kFrameLength; frame += 1) {
+      const float progress = static_cast<float>(frame) / static_cast<float>(kFrameLength - 1);
+      output[frame] *= previousGain + (nextGain - previousGain) * progress;
+    }
+  }
+};
+
 float attenuationForLevel(NSInteger level) {
   return -static_cast<float>(MAX(0, MIN(100, level))) * 0.8f;
 }
@@ -34,12 +98,24 @@ NSString* modelPath() {
   NSInteger _channels;
   std::vector<float> _input;
   std::vector<float> _output;
+  std::vector<float> _rawRing;
+  std::vector<float> _transitionFade;
+  std::vector<float> _lastOutput;
+  size_t _rawWriteSlot;
+  NSInteger _freshCoreFrames;
+  BOOL _wasFiltered;
+  BOOL _filteringRequested;
+  BOOL _timelineNeedsReset;
+  ResidualSuppression _residualSuppression;
+  std::atomic_bool _postFilterEnabled;
+  std::atomic_bool _pauseSuppressionEnabled;
+  BOOL _appliedPostFilterEnabled;
+  BOOL _appliedPauseSuppressionEnabled;
   std::atomic_bool _enabled;
   std::atomic_bool _overload;
   std::atomic<double> _averageFrameTimeMs;
   std::atomic_int _processedFrames;
   std::atomic_int _droppedFrames;
-  std::atomic_int _enableTransition;
   NSInteger _guardFrameCount;
   double _rollingFrameTimeMs;
   NSInteger _overDeadlineStreak;
@@ -61,7 +137,15 @@ NSString* modelPath() {
     _averageFrameTimeMs.store(0);
     _processedFrames.store(0);
     _droppedFrames.store(0);
-    _enableTransition.store(0);
+    _rawWriteSlot = 0;
+    _freshCoreFrames = 0;
+    _wasFiltered = NO;
+    _filteringRequested = NO;
+    _timelineNeedsReset = NO;
+    _postFilterEnabled.store(true);
+    _pauseSuppressionEnabled.store(true);
+    _appliedPostFilterEnabled = YES;
+    _appliedPauseSuppressionEnabled = YES;
     _guardFrameCount = 0;
     _rollingFrameTimeMs = 0;
     _overDeadlineStreak = 0;
@@ -80,8 +164,15 @@ NSString* modelPath() {
 }
 
 - (void)setEnabled:(BOOL)enabled {
-  const BOOL wasEnabled = _enabled.exchange(enabled);
-  if (enabled != wasEnabled) _enableTransition.store(enabled ? 1 : -1);
+  _enabled.store(enabled);
+}
+
+- (void)setPostFilterEnabled:(BOOL)enabled {
+  _postFilterEnabled.store(enabled);
+}
+
+- (void)setPauseSuppressionEnabled:(BOOL)enabled {
+  _pauseSuppressionEnabled.store(enabled);
 }
 
 - (void)setSuppressionLevel:(NSInteger)level {
@@ -116,12 +207,26 @@ NSString* modelPath() {
     return;
   }
   _channels = static_cast<NSInteger>(channels);
-  _input.assign(480, 0);
-  _output.assign(480, 0);
+  _input.assign(kFrameLength, 0);
+  _output.assign(kFrameLength, 0);
+  _rawRing.assign(kRawRingSlots * channels * kFrameLength, 0);
+  _lastOutput.assign(channels, 0);
+  _transitionFade.resize(kFrameLength);
+  for (size_t frame = 0; frame < kFrameLength; frame += 1) {
+    _transitionFade[frame] = 0.5f - 0.5f * std::cos(3.14159265358979323846f
+      * static_cast<float>(frame) / static_cast<float>(kFrameLength - 1));
+  }
+  _rawWriteSlot = 0;
+  _freshCoreFrames = 0;
+  _wasFiltered = NO;
+  _filteringRequested = _enabled.load() && _appliedSuppressionLevel > 0;
+  _timelineNeedsReset = NO;
+  _residualSuppression.reset();
+  _appliedPostFilterEnabled = _postFilterEnabled.load();
+  _appliedPauseSuppressionEnabled = _pauseSuppressionEnabled.load();
   _averageFrameTimeMs.store(0);
   _processedFrames.store(0);
   _droppedFrames.store(0);
-  _enableTransition.store(0);
   _guardFrameCount = 0;
   _rollingFrameTimeMs = 0;
   _overDeadlineStreak = 0;
@@ -136,81 +241,170 @@ NSString* modelPath() {
 #if !defined(MEETBRIDGE_DEEPFILTER_AVAILABLE)
   return;
 #else
-  const int enableTransition = _enableTransition.exchange(0);
-  if (enableTransition > 0) {
+  if (!_state) return;
+  if (audioBuffer.frames != kFrameLength || audioBuffer.channels != static_cast<size_t>(_channels)) {
+    // Do not replay history across an unexpected capture format discontinuity.
+    _timelineNeedsReset = YES;
+    _wasFiltered = NO;
+    _freshCoreFrames = 0;
+    _residualSuppression.reset();
+    return;
+  }
+  if (_timelineNeedsReset) {
+    std::fill(_rawRing.begin(), _rawRing.end(), 0.0f);
+    std::fill(_lastOutput.begin(), _lastOutput.end(), 0.0f);
+    _rawWriteSlot = 0;
+    _recoveryWarmupFrames = 20;
+    _timelineNeedsReset = NO;
+  }
+
+  const NSInteger suppressionLevel = _suppressionLevel.load();
+  const BOOL filteringRequested = _enabled.load() && suppressionLevel > 0;
+  if (filteringRequested && !_filteringRequested) {
     _autoBypassed = NO;
     _autoBypassFrames = 0;
     _recoveryWarmupFrames = 20;
+    _freshCoreFrames = 0;
     _guardFrameCount = 0;
     _rollingFrameTimeMs = 0;
     _overDeadlineStreak = 0;
     _sustainedHighAverageFrames = 0;
-  } else if (enableTransition < 0) {
+    _residualSuppression.reset();
+  } else if (!filteringRequested) {
     _autoBypassed = NO;
     _autoBypassFrames = 0;
     _recoveryWarmupFrames = 0;
+    _residualSuppression.reset();
   }
-  if (!_enabled.load() || !_state || audioBuffer.frames != 480 || audioBuffer.channels < 1) return;
+  _filteringRequested = filteringRequested;
+
+  const BOOL postFilterEnabled = _postFilterEnabled.load();
+  const BOOL pauseSuppressionEnabled = _pauseSuppressionEnabled.load();
+  if (postFilterEnabled != _appliedPostFilterEnabled
+      || pauseSuppressionEnabled != _appliedPauseSuppressionEnabled) {
+    _residualSuppression.reset();
+    _appliedPostFilterEnabled = postFilterEnabled;
+    _appliedPauseSuppressionEnabled = pauseSuppressionEnabled;
+  }
+
   if (_autoBypassed) {
     _autoBypassFrames += 1;
-    if (_autoBypassFrames < 100) return;
-    _autoBypassed = NO;
-    _autoBypassFrames = 0;
-    _recoveryWarmupFrames = 20;
-    _guardFrameCount = 0;
-    _rollingFrameTimeMs = 0;
-    _overDeadlineStreak = 0;
-    _sustainedHighAverageFrames = 0;
+    if (_autoBypassFrames >= 100) {
+      _autoBypassed = NO;
+      _autoBypassFrames = 0;
+      _recoveryWarmupFrames = 20;
+      _freshCoreFrames = 0;
+      _guardFrameCount = 0;
+      _rollingFrameTimeMs = 0;
+      _overDeadlineStreak = 0;
+      _sustainedHighAverageFrames = 0;
+      _residualSuppression.reset();
+    }
   }
-  CFTimeInterval startedAt = CACurrentMediaTime();
-  const NSInteger suppressionLevel = _suppressionLevel.load();
-  if (suppressionLevel != _appliedSuppressionLevel) {
-    df_set_atten_lim(_state, attenuationForLevel(suppressionLevel));
-    _appliedSuppressionLevel = suppressionLevel;
-  }
-  const NSInteger channels = MIN(_channels, static_cast<NSInteger>(audioBuffer.channels));
+
+  // Every supported callback advances this timeline, including user/CPU bypass.
+  // Keep each raw channel intact while the model consumes a normalized mono mix.
+  const size_t channels = static_cast<size_t>(_channels);
+  const size_t slotLength = channels * kFrameLength;
+  float* currentRaw = _rawRing.data() + _rawWriteSlot * slotLength;
+  const float* delayedRaw = _rawRing.data() + ((_rawWriteSlot + 1) % kRawRingSlots) * slotLength;
   std::fill(_input.begin(), _input.end(), 0.0f);
-  for (NSInteger channel = 0; channel < channels; channel += 1) {
+  for (size_t channel = 0; channel < channels; channel += 1) {
     const float* source = [audioBuffer rawBufferForChannel:static_cast<int>(channel)];
-    for (NSInteger frame = 0; frame < 480; frame += 1) {
+    for (size_t frame = 0; frame < kFrameLength; frame += 1) {
+      currentRaw[channel * kFrameLength + frame] = source[frame];
       _input[frame] += source[frame];
     }
   }
-  const float normalization = 1.0f / (static_cast<float>(channels) * 32768.0f);
-  for (NSInteger frame = 0; frame < 480; frame += 1) {
-    _input[frame] = std::clamp(_input[frame] * normalization, -1.0f, 1.0f);
-  }
-  df_process_frame(_state, _input.data(), _output.data());
-  const double elapsedMs = (CACurrentMediaTime() - startedAt) * 1000.0;
-  const int count = _processedFrames.fetch_add(1) + 1;
-  const double previous = _averageFrameTimeMs.load();
-  const double average = previous + (elapsedMs - previous) / count;
-  _averageFrameTimeMs.store(average);
-  _guardFrameCount += 1;
-  _rollingFrameTimeMs = _guardFrameCount == 1
-    ? elapsedMs
-    : _rollingFrameTimeMs * 0.95 + elapsedMs * 0.05;
-  _overDeadlineStreak = elapsedMs > 9.5 ? _overDeadlineStreak + 1 : 0;
-  _sustainedHighAverageFrames = _guardFrameCount > 100 && _rollingFrameTimeMs > 8.0
-    ? _sustainedHighAverageFrames + 1
-    : 0;
-  const BOOL sustainedOverload = _guardFrameCount > 100
-    && (_overDeadlineStreak >= 8 || _sustainedHighAverageFrames >= 50);
-  if (sustainedOverload) {
-    _autoBypassed = YES;
-    _autoBypassFrames = 0;
-    _overload.store(true);
-  }
-  const BOOL shouldUseFilteredOutput = !_autoBypassed && _recoveryWarmupFrames <= 0;
-  if (_recoveryWarmupFrames > 0) _recoveryWarmupFrames -= 1;
-  if (shouldUseFilteredOutput) {
-    for (NSInteger channel = 0; channel < channels; channel += 1) {
-      float* destination = [audioBuffer rawBufferForChannel:static_cast<int>(channel)];
-      for (NSInteger frame = 0; frame < 480; frame += 1) {
-        destination[frame] = std::clamp(_output[frame], -1.0f, 1.0f) * 32767.0f;
-      }
+
+  BOOL hasAlignedFilteredOutput = NO;
+  // On disable/level zero, finish one positive-attenuation frame for an aligned
+  // filtered-to-raw fade. Setting core attenuation to zero would remove its delay.
+  const BOOL shouldProcess = (filteringRequested && !_autoBypassed) || _wasFiltered;
+  if (shouldProcess) {
+    const CFTimeInterval startedAt = CACurrentMediaTime();
+    if (suppressionLevel > 0 && suppressionLevel != _appliedSuppressionLevel) {
+      df_set_atten_lim(_state, attenuationForLevel(suppressionLevel));
+      _appliedSuppressionLevel = suppressionLevel;
+      _residualSuppression.reset();
     }
+    const float normalization = 1.0f / (static_cast<float>(channels) * 32768.0f);
+    for (size_t frame = 0; frame < kFrameLength; frame += 1) {
+      _input[frame] = std::clamp(_input[frame] * normalization, -1.0f, 1.0f);
+    }
+    df_process_frame(_state, _input.data(), _output.data());
+    const BOOL validOutput = std::all_of(_output.begin(), _output.end(), [](float sample) {
+      return std::isfinite(sample);
+    });
+    if (validOutput) {
+      _freshCoreFrames = MIN(_freshCoreFrames + 1, static_cast<NSInteger>(kCoreDelayFrames + 1));
+      hasAlignedFilteredOutput = _freshCoreFrames > static_cast<NSInteger>(kCoreDelayFrames);
+      if (filteringRequested && hasAlignedFilteredOutput && _recoveryWarmupFrames <= 0
+          && (postFilterEnabled || pauseSuppressionEnabled)) {
+        _residualSuppression.process(_output.data(), delayedRaw, channels,
+          postFilterEnabled, pauseSuppressionEnabled);
+      } else {
+        _residualSuppression.reset();
+      }
+    } else {
+      _droppedFrames.fetch_add(1);
+      _freshCoreFrames = 0;
+      _recoveryWarmupFrames = 20;
+      _residualSuppression.reset();
+    }
+
+    const double elapsedMs = (CACurrentMediaTime() - startedAt) * 1000.0;
+    const int count = _processedFrames.fetch_add(1) + 1;
+    const double previous = _averageFrameTimeMs.load();
+    _averageFrameTimeMs.store(previous + (elapsedMs - previous) / count);
+    _guardFrameCount += 1;
+    _rollingFrameTimeMs = _guardFrameCount == 1
+      ? elapsedMs
+      : _rollingFrameTimeMs * 0.95 + elapsedMs * 0.05;
+    _overDeadlineStreak = elapsedMs > 9.5 ? _overDeadlineStreak + 1 : 0;
+    _sustainedHighAverageFrames = _guardFrameCount > 100 && _rollingFrameTimeMs > 8.0
+      ? _sustainedHighAverageFrames + 1
+      : 0;
+    const BOOL sustainedOverload = _guardFrameCount > 100
+      && (_overDeadlineStreak >= 8 || _sustainedHighAverageFrames >= 50);
+    if (sustainedOverload) {
+      _autoBypassed = YES;
+      _autoBypassFrames = 0;
+      _overload.store(true);
+    }
+  } else {
+    _freshCoreFrames = 0;
+    _residualSuppression.reset();
   }
+
+  const BOOL shouldUseFilteredOutput = filteringRequested && !_autoBypassed
+    && hasAlignedFilteredOutput && _recoveryWarmupFrames <= 0;
+  const BOOL changingOutput = shouldUseFilteredOutput != _wasFiltered;
+  for (size_t channel = 0; channel < channels; channel += 1) {
+    float* destination = [audioBuffer rawBufferForChannel:static_cast<int>(channel)];
+    const float* raw = delayedRaw + channel * kFrameLength;
+    const float boundaryCorrection = _lastOutput[channel] - raw[0];
+    for (size_t frame = 0; frame < kFrameLength; frame += 1) {
+      float sample = raw[frame];
+      if (shouldUseFilteredOutput || (changingOutput && hasAlignedFilteredOutput)) {
+        const float filtered = std::clamp(_output[frame], -1.0f, 1.0f) * 32767.0f;
+        const float wet = changingOutput
+          ? (shouldUseFilteredOutput ? _transitionFade[frame] : 1.0f - _transitionFade[frame])
+          : 1.0f;
+        sample += (filtered - sample) * wet;
+      } else if (changingOutput) {
+        // Invalid output cannot be faded as a waveform; preserve its last sample
+        // at the boundary without repeating a stale speech frame.
+        sample += boundaryCorrection * (1.0f - _transitionFade[frame]);
+      }
+      destination[frame] = std::clamp(sample, -32768.0f, 32767.0f);
+    }
+    _lastOutput[channel] = destination[kFrameLength - 1];
+  }
+  _wasFiltered = shouldUseFilteredOutput;
+  _rawWriteSlot = (_rawWriteSlot + 1) % kRawRingSlots;
+  if (shouldProcess && _recoveryWarmupFrames > 0) _recoveryWarmupFrames -= 1;
+  if (!shouldUseFilteredOutput) _residualSuppression.reset();
 #endif
 }
 
@@ -221,6 +415,15 @@ NSString* modelPath() {
   _state = nullptr;
   _input.clear();
   _output.clear();
+  _rawRing.clear();
+  _transitionFade.clear();
+  _lastOutput.clear();
+  _rawWriteSlot = 0;
+  _freshCoreFrames = 0;
+  _wasFiltered = NO;
+  _filteringRequested = NO;
+  _timelineNeedsReset = NO;
+  _residualSuppression.reset();
 }
 
 - (NSDictionary<NSString*, id>*)statsAndClearOverload {

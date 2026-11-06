@@ -17,6 +17,8 @@ class MeetbridgeNoiseFilterModule : Module() {
     }
 
     AsyncFunction("acquire") { options: Map<String, Any?> ->
+      processor.setPostFilterEnabled(options["postFilter"] as? Boolean ?: true)
+      processor.setPauseSuppressionEnabled(options["pauseSuppression"] as? Boolean ?: true)
       processor.acquire(
         enabled = options["enabled"] as? Boolean ?: true,
         suppressionLevel = (options["suppressionLevel"] as? Number)?.toInt() ?: 80,
@@ -33,6 +35,11 @@ class MeetbridgeNoiseFilterModule : Module() {
 
     AsyncFunction("setSuppressionLevel") { suppressionLevel: Int ->
       processor.setSuppressionLevel(suppressionLevel)
+    }
+
+    AsyncFunction("setEnhancementOptions") { options: Map<String, Any?> ->
+      processor.setPostFilterEnabled(options["postFilter"] as? Boolean ?: true)
+      processor.setPauseSuppressionEnabled(options["pauseSuppression"] as? Boolean ?: true)
     }
 
     AsyncFunction("getStats") {

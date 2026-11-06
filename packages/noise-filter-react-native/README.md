@@ -43,6 +43,10 @@ the Android LiveKit hardware NoiseSuppressor while retaining hardware AEC.
 
 - getNoiseFilterAvailability returns native support and a human-readable reason.
 - acquireNoiseFilterLease adds a reference-counted global capture processor.
+- Its options include enabled, suppressionLevel, postFilter, and
+  pauseSuppression. Both enhancement flags default to true and can be disabled
+  independently. As with enabled/strength, the latest lease configuration
+  applies to the shared processor.
 - A lease supports setEnabled, setSuppressionLevel, getStats, release, and
   destroy.
 - addNoiseFilterEventListener listens for overload.
@@ -59,13 +63,41 @@ consecutive frames above 9.5 ms or 50 rolling-average frames above 8 ms. It
 retries automatically after 100 raw frames and 20 model warmup frames. A
 disabled-to-enabled transition also uses the 20-frame warmup, and releasing the
 last native lease causes recurrent model state to be discarded before the next
-capture attaches. The Android raw fallback restores a preallocated PCM
-snapshot, preserving the
-published native wrapper JNI ABI and avoiding audio-thread allocations.
+capture attaches. While attached, the processor maintains a preallocated
+30 ms raw timeline, including during manual bypass and suppression level zero.
+The first three capture hops prime that timeline with silence. Filtered/raw
+transitions use a 10 ms raised-cosine crossfade between aligned frames. Recovery
+warms the model before fading back in. Unsupported capture formats pass through
+unchanged and reset the history before supported processing resumes.
+Android preserves the published JNI ABI and both wrappers avoid new per-frame
+buffer allocations.
 On iOS, WebRTC exposes `RTCAudioBuffer` channels as float values in the S16
 range. The processor normalizes those samples before DeepFilterNet3 inference
 and scales the clamped model output back to S16 so LiveKit and PCM taps receive
 the same level as Android and Web.
+
+## Gentle residual suppression
+
+The wrappers implement the same conservative broadband residual post-filter
+and soft pause suppression as the web Worker. They use the existing model and
+core binaries; the core's spectral post-filter is not enabled. Android's
+committed JNI interface does not expose that spectral setting.
+
+Attenuation starts only after 250 ms of filtered audio with RMS at most
+-50 dBFS, peak at most -38 dBFS, and at least 12 dB of suppression relative to
+the raw audio from the same point in time. The post-filter removes up to 1 dB.
+Pause suppression starts below -58 dBFS and removes up to another 3 dB.
+Closing uses a 150 ms time constant with gain interpolation within each hop.
+The combined reduction is capped at 4 dB and never hard-mutes audio. Any frame
+outside those conditions receives unity gain throughout and restarts the hold.
+This energy heuristic is deliberately conservative; it is not a speech
+classifier. Bypass, warmup, discontinuities, and configuration changes reset it.
+
+Set postFilter: false and pauseSuppression: false when acquiring a lease to
+use only model output. These native wrapper changes take effect in a new
+application binary; a JS-only update remains compatible with an older native
+module but cannot add the new audio behavior to it. Consuming applications
+continue linking the prebuilt core and do not compile Rust.
 
 ## Native package contents
 

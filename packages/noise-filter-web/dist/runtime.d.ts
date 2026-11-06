@@ -6,6 +6,8 @@ export interface DeepFilterRuntimeOptions {
     suppressionLevel?: number;
     enabled?: boolean;
     latencyMode?: DeepFilterLatencyMode;
+    postFilter?: boolean;
+    pauseSuppression?: boolean;
     onEvent?: (event: DeepFilterRuntimeEvent) => void;
 }
 export type DeepFilterRuntimeEvent = {

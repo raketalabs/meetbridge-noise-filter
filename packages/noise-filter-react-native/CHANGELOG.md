@@ -2,7 +2,19 @@
 
 All notable changes to this package are documented in this file.
 
-## Unreleased
+## 0.2.2
+
+### Changed
+
+- Add default-on, independently configurable wrapper residual post-filter
+  (up to 1 dB) and soft pause suppression (up to 3 dB), with aligned raw-energy
+  comparison, a 250 ms hold, and full-hop unity gain for potential speech.
+- Keep native manual/CPU/zero-level bypass on a 30 ms raw timeline; use aligned
+  10 ms crossfades and warm recovery to avoid skipping or replaying speech.
+- Preserve existing Android JNI/iOS core binaries and allow newer JS options
+  to coexist with an older installed native module.
+
+## 0.2.1
 
 ### Fixed
 
@@ -18,10 +30,6 @@ All notable changes to this package are documented in this file.
 - Convert iOS WebRTC `RTCAudioBuffer` samples from its float S16 range to the
   normalized DeepFilterNet3 range before inference, then clamp and scale model
   output back to float S16 for LiveKit encoding and local PCM renderers.
-
-## 0.2.1
-
-### Fixed
 
 - Serialize native lease acquisition, configuration, and release to avoid
   leaking the shared capture processor during concurrent operations.

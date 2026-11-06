@@ -1,6 +1,6 @@
 {
   "name": "@raketalabs/meetbridge-noise-filter-web",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Client-side DeepFilterNet3 audio processor for LiveKit browsers and Electron",
   "license": "MIT OR Apache-2.0",
   "repository": {

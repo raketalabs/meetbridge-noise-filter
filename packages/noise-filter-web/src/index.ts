@@ -40,6 +40,10 @@ export interface DeepFilterStats {
 export interface DeepFilterProcessorOptions {
   suppressionLevel?: number
   enabled?: boolean
+  /** Gentle residual-noise attenuation (up to 1 dB). Defaults to true. */
+  postFilter?: boolean
+  /** Soft attenuation during sustained quiet intervals (up to 3 dB). Defaults to true. */
+  pauseSuppression?: boolean
   assetBaseUrl?: string
   latencyMode?: DeepFilterLatencyMode
 }
@@ -98,6 +102,8 @@ export class DeepFilterProcessor extends EventTarget {
   private connectionId = 0
   private enabled: boolean
   private suppressionLevel: number
+  private readonly postFilter: boolean
+  private readonly pauseSuppression: boolean
   private readonly assetBaseUrl?: string
   private readonly latencyMode: DeepFilterLatencyMode
   private stats: DeepFilterStats = {
@@ -118,6 +124,8 @@ export class DeepFilterProcessor extends EventTarget {
     super()
     this.enabled = options.enabled !== false
     this.suppressionLevel = clampLevel(options.suppressionLevel)
+    this.postFilter = options.postFilter !== false
+    this.pauseSuppression = options.pauseSuppression !== false
     this.assetBaseUrl = options.assetBaseUrl
     this.latencyMode = resolveDeepFilterLatencyMode(options.latencyMode)
     this.stats.algorithmicLatencyMs = (deepFilterTransportHops(this.latencyMode) + 3) * 10
@@ -190,6 +198,8 @@ export class DeepFilterProcessor extends EventTarget {
       runtime = await createDeepFilterRuntimeNode(options.audioContext, {
         enabled: this.enabled,
         suppressionLevel: this.suppressionLevel,
+        postFilter: this.postFilter,
+        pauseSuppression: this.pauseSuppression,
         assetBaseUrl: this.assetBaseUrl,
         latencyMode: this.latencyMode,
         onEvent: event => { if (current()) this.handleRuntimeEvent(event) },

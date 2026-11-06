@@ -1,7 +1,7 @@
 # Install into any MeetBridge branch
 
 This procedure moves a MeetBridge branch from local `file:` packages to the
-private, immutable `0.2.1` GitHub Packages release. Application imports and the
+private, immutable `0.2.2` GitHub Packages release. Application imports and the
 current Web, Electron, and Mobile integration APIs remain unchanged.
 
 ## 1. Authenticate npm once
@@ -25,7 +25,7 @@ In the root `package.json`, replace the local dependency with this npm alias:
 ```json
 {
   "dependencies": {
-    "@meetbridge/noise-filter-web": "npm:@raketalabs/meetbridge-noise-filter-web@0.2.1"
+    "@meetbridge/noise-filter-web": "npm:@raketalabs/meetbridge-noise-filter-web@0.2.2"
   }
 }
 ```
@@ -52,7 +52,7 @@ In `MeetBridgeDesktopApp/package.json`, use the same alias:
 ```json
 {
   "dependencies": {
-    "@meetbridge/noise-filter-web": "npm:@raketalabs/meetbridge-noise-filter-web@0.2.1"
+    "@meetbridge/noise-filter-web": "npm:@raketalabs/meetbridge-noise-filter-web@0.2.2"
   }
 }
 ```
@@ -75,7 +75,7 @@ In `MeetBridgeMobile/package.json`, replace the local dependency with:
 ```json
 {
   "dependencies": {
-    "@meetbridge/noise-filter-react-native": "npm:@raketalabs/meetbridge-noise-filter-react-native@0.2.1"
+    "@meetbridge/noise-filter-react-native": "npm:@raketalabs/meetbridge-noise-filter-react-native@0.2.2"
   }
 }
 ```
@@ -149,7 +149,7 @@ that processed track, not from a second raw `getUserMedia` capture.
 
 ## 7. Rollback and upgrades
 
-Rollback is an exact dependency change; replace `0.2.1` in the npm alias with a
+Rollback is an exact dependency change; replace `0.2.2` in the npm alias with a
 previous published version and reinstall. Never use an unpinned `latest` range
 for meeting audio.
 

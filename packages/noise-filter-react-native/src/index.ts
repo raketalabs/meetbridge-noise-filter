@@ -25,12 +25,23 @@ export interface NoiseFilterEventSubscription {
   remove(): void
 }
 
+export interface NoiseFilterOptions {
+  enabled?: boolean
+  suppressionLevel?: number
+  /** Gentle residual-noise attenuation (up to 1 dB). Defaults to true. */
+  postFilter?: boolean
+  /** Soft attenuation during sustained quiet intervals (up to 3 dB). Defaults to true. */
+  pauseSuppression?: boolean
+}
+
 interface NativeNoiseFilterModule {
   getAvailability(): Promise<NoiseFilterAvailability>
-  acquire(options: { enabled: boolean, suppressionLevel: number }): Promise<void>
+  acquire(options: Required<NoiseFilterOptions>): Promise<void>
   release(): Promise<void>
   setEnabled(enabled: boolean): Promise<void>
   setSuppressionLevel(level: number): Promise<void>
+  // Optional so a JS update can still run against an older installed native module.
+  setEnhancementOptions?(options: { postFilter: boolean, pauseSuppression: boolean }): Promise<void>
   getStats(): Promise<NoiseFilterStats>
 }
 
@@ -125,10 +136,7 @@ export async function getNoiseFilterAvailability(): Promise<NoiseFilterAvailabil
   }
 }
 
-export async function acquireNoiseFilterLease(options: {
-  enabled?: boolean
-  suppressionLevel?: number
-} = {}): Promise<NoiseFilterLease> {
+export async function acquireNoiseFilterLease(options: NoiseFilterOptions = {}): Promise<NoiseFilterLease> {
   const native = resolveNativeModule()
   const availability = await getNoiseFilterAvailability()
   if (!native || !availability.supported) {
@@ -137,10 +145,13 @@ export async function acquireNoiseFilterLease(options: {
 
   const enabled = options.enabled !== false
   const suppressionLevel = clampLevel(options.suppressionLevel)
+  const postFilter = options.postFilter !== false
+  const pauseSuppression = options.pauseSuppression !== false
   await serializeNativeOperation(async () => {
     if (activeLeaseCount === 0) {
-      await native.acquire({ enabled, suppressionLevel })
+      await native.acquire({ enabled, suppressionLevel, postFilter, pauseSuppression })
     } else {
+      await native.setEnhancementOptions?.({ postFilter, pauseSuppression })
       await native.setEnabled(enabled)
       await native.setSuppressionLevel(suppressionLevel)
     }

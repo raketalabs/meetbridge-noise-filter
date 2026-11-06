@@ -18,6 +18,8 @@ public final class MeetbridgeNoiseFilterModule: Module {
     AsyncFunction("acquire") { (options: [String: Any]) in
       let enabled = options["enabled"] as? Bool ?? true
       let suppressionLevel = options["suppressionLevel"] as? Int ?? 80
+      self.processor.setPostFilterEnabled(options["postFilter"] as? Bool ?? true)
+      self.processor.setPauseSuppressionEnabled(options["pauseSuppression"] as? Bool ?? true)
       self.processor.isEnabled = enabled
       self.processor.setSuppressionLevel(suppressionLevel)
       if !self.attached {
@@ -43,6 +45,11 @@ public final class MeetbridgeNoiseFilterModule: Module {
 
     AsyncFunction("setSuppressionLevel") { (suppressionLevel: Int) in
       self.processor.setSuppressionLevel(suppressionLevel)
+    }
+
+    AsyncFunction("setEnhancementOptions") { (options: [String: Any]) in
+      self.processor.setPostFilterEnabled(options["postFilter"] as? Bool ?? true)
+      self.processor.setPauseSuppressionEnabled(options["pauseSuppression"] as? Bool ?? true)
     }
 
     AsyncFunction("getStats") {

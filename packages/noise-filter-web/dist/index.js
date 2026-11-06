@@ -461,11 +461,21 @@ function workerBootstrap() {
   let bindings = null;
   let dataPort = null;
   let requestedEnabled = true;
+  let suppressionLevel = 70;
   let autoBypassed = false;
   let autoBypassFrames = 0;
   let recoveryWarmupFrames = 0;
   const modelInput = new Float32Array(480);
   let consecutiveProcessedFrames = 3;
+  let postFilterEnabled = true;
+  let pauseSuppressionEnabled = true;
+  let quietHoldFrames = 25;
+  let postFilterGain = 1;
+  let pauseSuppressionGain = 1;
+  const rawPowers = new Float64Array(4);
+  const rawPowerSequences = new Float64Array(4).fill(-1);
+  const qualityClosing = 1 - Math.exp(-0.01 / 0.15);
+  const qualityOpening = 1 - Math.exp(-0.01 / 0.005);
   let frameCount = 0;
   let frameTimeTotal = 0;
   let guardFrameCount = 0;
@@ -484,6 +494,67 @@ function workerBootstrap() {
   }
   function toAttenuation(level) {
     return -Math.max(0, Math.min(100, Number(level) || 0)) * 0.8;
+  }
+  function resetOutputQuality(clearReference = false) {
+    quietHoldFrames = 25;
+    postFilterGain = 1;
+    pauseSuppressionGain = 1;
+    if (clearReference) rawPowerSequences.fill(-1);
+  }
+  function rememberRawPower(input, sequence) {
+    let power = 0;
+    for (let index = 0; index < input.length; index += 1) power += input[index] * input[index];
+    const slot = sequence % 4;
+    rawPowers[slot] = power / input.length;
+    rawPowerSequences[slot] = sequence;
+  }
+  function applyOutputQuality(output, sequence) {
+    // Match the DF3 output to its input three hops earlier. Comparing it to
+    // the current microphone hop would mistake speech onsets for residuals.
+    const rawSequence = sequence - 3;
+    const rawSlot = rawSequence % 4;
+    if ((!postFilterEnabled && !pauseSuppressionEnabled)
+      || rawSequence < 0 || rawPowerSequences[rawSlot] !== rawSequence) {
+      resetOutputQuality();
+      return;
+    }
+    let power = 0;
+    let peak = 0;
+    for (let index = 0; index < output.length; index += 1) {
+      const sample = output[index];
+      power += sample * sample;
+      peak = Math.max(peak, Math.abs(sample));
+    }
+    const outputDb = 10 * Math.log10(Math.max(power / output.length, 1e-12));
+    const peakDb = 20 * Math.log10(Math.max(peak, 1e-6));
+    const rawDb = 10 * Math.log10(Math.max(rawPowers[rawSlot], 1e-12));
+    const suppressionDb = rawDb - outputDb;
+    const quietResidual = suppressionDb >= 12 && outputDb <= -50 && peakDb <= -38;
+    if (!quietResidual) {
+      // Give every potential speech onset its complete hop at unity gain.
+      resetOutputQuality();
+      return;
+    }
+    if (quietHoldFrames > 0) {
+      quietHoldFrames -= 1;
+      return;
+    }
+    // This is a bounded broadband residual post-filter, not the core's
+    // spectral post-filter or a voice classifier. Never hard-mute pauses.
+    const suppressedWeight = Math.max(0, Math.min(1, (suppressionDb - 12) / 12));
+    const residualWeight = Math.max(0, Math.min(1, (-50 - outputDb) / 10));
+    const pauseWeight = Math.max(0, Math.min(1, (-58 - outputDb) / 10));
+    const postTarget = postFilterEnabled ? Math.pow(10, -suppressedWeight * residualWeight / 20) : 1;
+    const pauseTarget = pauseSuppressionEnabled ? Math.pow(10, -3 * pauseWeight / 20) : 1;
+    const previousGain = postFilterGain * pauseSuppressionGain;
+    postFilterGain += (postTarget - postFilterGain)
+      * (postTarget > postFilterGain ? qualityOpening : qualityClosing);
+    pauseSuppressionGain += (pauseTarget - pauseSuppressionGain)
+      * (pauseTarget > pauseSuppressionGain ? qualityOpening : qualityClosing);
+    const nextGain = postFilterGain * pauseSuppressionGain;
+    for (let index = 0; index < output.length; index += 1) {
+      output[index] *= previousGain + (nextGain - previousGain) * (index + 1) / output.length;
+    }
   }
   function sinc(value) {
     if (Math.abs(value) < 1e-8) return 1;
@@ -614,6 +685,9 @@ function workerBootstrap() {
   }
   async function initialise(config) {
     requestedEnabled = config.enabled !== false;
+    postFilterEnabled = config.postFilter !== false;
+    pauseSuppressionEnabled = config.pauseSuppression !== false;
+    resetOutputQuality(true);
     resetOverloadGuard();
     phase = 'loading-assets';
     const [loadedBindings, wasmBytes, model] = await Promise.all([
@@ -628,7 +702,7 @@ function workerBootstrap() {
     await initialiseWasm({ module_or_path: wasmBytes });
     phase = 'creating-state';
     const configuredLevel = Number(config.suppressionLevel);
-    const suppressionLevel = Number.isFinite(configuredLevel) ? configuredLevel : 70;
+    suppressionLevel = Number.isFinite(configuredLevel) ? Math.max(0, Math.min(100, configuredLevel)) : 70;
     state = bindings?.df_create(model, toAttenuation(suppressionLevel));
     if (!state) throw new Error('DeepFilterNet3 state could not initialise');
     if (bindings.df_get_frame_length(state) !== 480) {
@@ -663,7 +737,10 @@ function workerBootstrap() {
         returnRawFrame(data, input);
         return;
       }
-      if (sequence !== lastSequence + 1) consecutiveProcessedFrames = 0;
+      if (sequence !== lastSequence + 1) {
+        consecutiveProcessedFrames = 0;
+        resetOutputQuality(true);
+      }
       lastSequence = sequence;
       if (autoBypassed) {
         autoBypassFrames += 1;
@@ -675,17 +752,23 @@ function workerBootstrap() {
           postMessage({ type: "recovering" });
         }
       }
-      const shouldProcess = requestedEnabled && !autoBypassed && Boolean(bindings) && Boolean(state);
+      const shouldProcess = requestedEnabled && suppressionLevel > 0
+        && !autoBypassed && Boolean(bindings) && Boolean(state);
       if (!shouldProcess || !bindings || !state) {
         consecutiveProcessedFrames = 0;
+        resetOutputQuality(true);
         returnRawFrame(data, input);
         return;
       }
       phase = "processing-frame";
       const startedAt = performance.now();
       if (input.length !== 480) resampleInto(input, modelInput);
-      const processed = bindings.df_process_frame(state, input.length === 480 ? input : modelInput);
+      const coreInput = input.length === 480 ? input : modelInput;
+      rememberRawPower(coreInput, sequence);
+      const processed = bindings.df_process_frame(state, coreInput);
       consecutiveProcessedFrames = Math.min(4, consecutiveProcessedFrames + 1);
+      if (recoveryWarmupFrames <= 0 && consecutiveProcessedFrames > 3) applyOutputQuality(processed, sequence);
+      else resetOutputQuality();
       if (input.length === processed.length) input.set(processed);
       else resampleInto(processed, input);
       const frameTimeMs = performance.now() - startedAt;
@@ -702,6 +785,7 @@ function workerBootstrap() {
       if (sustainedOverload) {
         autoBypassed = true;
         autoBypassFrames = 0;
+        resetOutputQuality(true);
         postMessage({
           type: "overload",
           avgFrameTimeMs,
@@ -737,6 +821,7 @@ function workerBootstrap() {
       const stack = error instanceof Error ? error.stack : void 0;
       requestedEnabled = false;
       consecutiveProcessedFrames = 0;
+      resetOutputQuality(true);
       if (!errorReported) {
         errorReported = true;
         postMessage({ type: "error", message, phase, stack });
@@ -758,6 +843,7 @@ function workerBootstrap() {
       }
       if (data.type === "enabled") {
         const nextEnabled = data.enabled !== false;
+        resetOutputQuality(true);
         if (nextEnabled && !requestedEnabled) {
           recoveryWarmupFrames = 20;
           resetOverloadGuard();
@@ -771,7 +857,23 @@ function workerBootstrap() {
         return;
       }
       if (data.type === "suppression-level") {
-        if (bindings && state) bindings.df_set_atten_lim(state, toAttenuation(Number(data.level) || 0));
+        const nextLevel = Math.max(0, Math.min(100, Number(data.level) || 0));
+        if (nextLevel === suppressionLevel) return;
+        resetOutputQuality(true);
+        if (nextLevel > 0 && suppressionLevel === 0) {
+          // A zero attenuation limit makes the core return undelayed input.
+          // Keep it on the aligned bypass path, then flush before resuming.
+          recoveryWarmupFrames = 20;
+          resetOverloadGuard();
+        }
+        suppressionLevel = nextLevel;
+        if (nextLevel === 0) {
+          consecutiveProcessedFrames = 0;
+          autoBypassed = false;
+          autoBypassFrames = 0;
+          recoveryWarmupFrames = 0;
+        }
+        if (bindings && state) bindings.df_set_atten_lim(state, toAttenuation(nextLevel));
         return;
       }
       if (data.type === "destroy") {
@@ -809,6 +911,8 @@ async function createDeepFilterRuntimeNode(audioContext, options = {}) {
   const assets = await resolveDeepFilterAssets(options.assetBaseUrl);
   await installWorkletModule(audioContext);
   const latencyMode = resolveDeepFilterLatencyMode(options.latencyMode);
+  let requestedEnabled = options.enabled !== false;
+  let suppressionLevel = clampLevel(options.suppressionLevel);
   const node = new AudioWorkletNode(audioContext, PROCESSOR_NAME, {
     channelCount: 1,
     channelCountMode: "explicit",
@@ -816,7 +920,7 @@ async function createDeepFilterRuntimeNode(audioContext, options = {}) {
     numberOfOutputs: 1,
     outputChannelCount: [1],
     processorOptions: {
-      enabled: options.enabled !== false,
+      enabled: requestedEnabled && suppressionLevel > 0,
       latencyMode
     }
   });
@@ -951,8 +1055,10 @@ Worker: ${String(data.stack)}`;
     type: "init",
     ...assets,
     sampleRate: audioContext.sampleRate,
-    enabled: options.enabled !== false,
-    suppressionLevel: clampLevel(options.suppressionLevel)
+    enabled: requestedEnabled,
+    suppressionLevel,
+    postFilter: options.postFilter !== false,
+    pauseSuppression: options.pauseSuppression !== false
   });
   try {
     await ready;
@@ -969,11 +1075,14 @@ Worker: ${String(data.stack)}`;
   }
   controllers.set(node, {
     setEnabled(enabled) {
-      node.port.postMessage({ type: "enabled", enabled });
+      requestedEnabled = enabled;
+      node.port.postMessage({ type: "enabled", enabled: requestedEnabled && suppressionLevel > 0 });
       worker.postMessage({ type: "enabled", enabled });
     },
     setSuppressionLevel(level) {
-      worker.postMessage({ type: "suppression-level", level: clampLevel(level) });
+      suppressionLevel = clampLevel(level);
+      node.port.postMessage({ type: "enabled", enabled: requestedEnabled && suppressionLevel > 0 });
+      worker.postMessage({ type: "suppression-level", level: suppressionLevel });
     },
     waitUntilPrimed() {
       return primed;
@@ -1468,6 +1577,8 @@ var DeepFilterProcessor = class _DeepFilterProcessor extends EventTarget {
   connectionId = 0;
   enabled;
   suppressionLevel;
+  postFilter;
+  pauseSuppression;
   assetBaseUrl;
   latencyMode;
   stats = {
@@ -1487,6 +1598,8 @@ var DeepFilterProcessor = class _DeepFilterProcessor extends EventTarget {
     super();
     this.enabled = options.enabled !== false;
     this.suppressionLevel = clampLevel2(options.suppressionLevel);
+    this.postFilter = options.postFilter !== false;
+    this.pauseSuppression = options.pauseSuppression !== false;
     this.assetBaseUrl = options.assetBaseUrl;
     this.latencyMode = resolveDeepFilterLatencyMode(options.latencyMode);
     this.stats.algorithmicLatencyMs = (deepFilterTransportHops(this.latencyMode) + 3) * 10;
@@ -1550,6 +1663,8 @@ var DeepFilterProcessor = class _DeepFilterProcessor extends EventTarget {
       runtime = await createDeepFilterRuntimeNode(options.audioContext, {
         enabled: this.enabled,
         suppressionLevel: this.suppressionLevel,
+        postFilter: this.postFilter,
+        pauseSuppression: this.pauseSuppression,
         assetBaseUrl: this.assetBaseUrl,
         latencyMode: this.latencyMode,
         onEvent: (event) => { if (current()) this.handleRuntimeEvent(event); }
